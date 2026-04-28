@@ -11,6 +11,11 @@
   - treeform/whisky for websockets (or treeform/ws if we have issues)
   - openai_leap to borrow the API structures, and for API integration tests
 
+- models
+  - GGUF models are stored at `/mnt/steel-chest/LLM/lmstudio/models/`
+  - `TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf` — benchmark reference model from tinylama
+  - `lmstudio-community/Llama-3.2-1B-Instruct-GGUF/` — small test models (Q4_K_M, Q8_0)
+
 - reference repos
   - refer to ../scriptorium/ for the nimby.lock structure and makefile structure. we want unit, integration and e2e tests.
   - refer to ../tinylama for a reference initial performant implementation of llm inference using hippo
