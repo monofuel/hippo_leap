@@ -3,28 +3,65 @@
 - OpenAI-compatible LLM inference server in Nim.
 - Uses hippo for GPU compute, mummy for HTTP serving, openai_leap for API types.
 
+## Project layout
+
+- `src/hippo_leap.nim` — main binary entry point (CLI dispatch)
+- `src/hippo_leap/` — library modules (common, config, server, handlers)
+- `src/tools/` — standalone CLI tool binaries (health_check)
+- `tests/test_*.nim` — unit tests
+- `tests/integration_*.nim` — integration tests
+- `tests/e2e_*.nim` — end-to-end tests
+- `tests/helpers.nim` — shared test utilities
+- `docs/` — design docs, benchmarks, future optimization ideas
+
 ## Dependencies
 
 - Nim >= 2.0.0
-- hippo for GPU (CUDA/HIP) operations
-- mummy for HTTP server
-- openai_leap for OpenAI-compatible API types
-- jsony for JSON serialization
-- curly for HTTP client operations
-- ws for WebSocket support
+- hippo — GPU library for CUDA/HIP operations (monofuel/hippo)
+- mummy — HTTP server
+- openai_leap — OpenAI-compatible API types and client (monofuel/openai_leap)
+- jsony — JSON serialization
+- curly — HTTP client
+- ws — WebSocket support
+
+All dependencies are pinned in `nimby.lock` with exact versions and commit hashes.
+
+## Nimby
+
+This project uses nimby for dependency management instead of nimble.
+
+- `nimby.lock` pins every dependency to a specific git commit
+- Run `nimby sync -g nimby.lock` to clone/update all dependencies and generate `nim.cfg`
+- The generated `nim.cfg` contains `--path:` entries pointing to `~/.nimby/pkgs/<name>/src`
+- After syncing, `nim c` and `nim r` will find all dependencies automatically
+- To add or update a dependency, edit `nimby.lock` and re-run sync
 
 ## Build
 
-- Run `nimby sync -g nimby.lock` to install dependencies and generate nim.cfg
-- Run `make build` to compile the main binary
-- Run `make tools` to compile CLI tools
+- `make build` — compile the main `hippo_leap` binary
+- `make tools` — compile CLI tools (health_check)
+- Binary output lands in the project root (gitignored)
 
 ## Tests
 
-- Run `make test` to run all unit tests
-- Run `make integration-test` to run integration tests
-- Run `make e2e-test` to run end-to-end tests
+- `make test` — run all unit tests (`tests/test_*.nim`) in parallel
+- `make integration-test` — run integration tests (`tests/integration_*.nim`) in parallel
+- `make e2e-test` — run end-to-end tests (`tests/e2e_*.nim`) sequentially
 - Individual test files can be run with `nim r tests/test_*.nim`
+
+## Models
+
+- GGUF models are stored on the NFS share at `/mnt/steel-chest/LLM/lmstudio/models/`
+- `TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf` — benchmark reference model from tinylama
+- `lmstudio-community/Llama-3.2-1B-Instruct-GGUF/` — small test models (Q4_K_M, Q8_0)
+
+## Reference repos
+
+- `../scriptorium/` — nimby.lock structure, Makefile patterns, test organization
+- `../tinylama` — reference performant LLM inference implementation using hippo
+- `../openai_leap/` — OpenAI API types and client
+- `../andrewlytics` — mummy HTTP server examples, streaming workarounds
+- `../hippo` — Nim HIP/CUDA GPU library (maintained by monofuel)
 
 ## Nim best practices
 
