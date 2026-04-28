@@ -1,0 +1,61 @@
+.PHONY: test integration-test e2e-test build tools
+
+nim.cfg: nimby.lock
+	nimby sync -g nimby.lock
+
+build: nim.cfg hippo_leap
+
+hippo_leap: src/hippo_leap.nim
+	nim c -o:hippo_leap src/hippo_leap.nim
+
+tools: nim.cfg
+	nim c -o:health_check src/tools/health_check.nim
+
+NIM_TEST_FLAGS ?= --hints:off --warnings:off
+
+test: nim.cfg
+	@files=$$(ls tests/test_*.nim 2>/dev/null); \
+	if [ -z "$$files" ]; then \
+		echo "No unit tests found in tests/test_*.nim"; \
+		exit 0; \
+	fi; \
+	fail=0; \
+	pids=""; \
+	for f in $$files; do \
+		( nim r $(NIM_TEST_FLAGS) "$$f" 2>&1 | sed "s|^|[$$f] |" ) & \
+		pids="$$pids $$!"; \
+	done; \
+	for pid in $$pids; do \
+		wait $$pid || fail=1; \
+	done; \
+	exit $$fail
+
+integration-test: nim.cfg
+	@export TMPDIR=/dev/shm; \
+	files=$$(ls tests/integration_*.nim 2>/dev/null); \
+	if [ -z "$$files" ]; then \
+		echo "No integration tests found in tests/integration_*.nim"; \
+		exit 0; \
+	fi; \
+	fail=0; \
+	pids=""; \
+	for f in $$files; do \
+		( nim r $(NIM_TEST_FLAGS) "$$f" 2>&1 | sed "s|^|[$$f] |" ) & \
+		pids="$$pids $$!"; \
+	done; \
+	for pid in $$pids; do \
+		wait $$pid || fail=1; \
+	done; \
+	exit $$fail
+
+e2e-test: nim.cfg
+	@found=0; \
+	for f in tests/e2e_*.nim; do \
+		[ -e "$$f" ] || continue; \
+		found=1; \
+		echo "--- $$f ---"; \
+		nim r $(NIM_TEST_FLAGS) "$$f" || exit 1; \
+	done; \
+	if [ $$found -eq 0 ]; then \
+		echo "No e2e tests found in tests/e2e_*.nim"; \
+	fi

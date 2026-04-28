@@ -1,10 +1,22 @@
-name: Github Actions
-on: [push, pull_request]
+name: Build And Test
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+concurrency:
+  group: build-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
-    - uses: treeform/setup-nim-action@v2
-    - run: nimble test -y
+      - uses: actions/checkout@v4
+      - uses: treeform/setup-nim-action@v6
+      - run: nimby sync -g nimby.lock
+      - run: make test
+      - run: make build

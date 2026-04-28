@@ -1,20 +1,30 @@
-# {PROJECT_NAME}
+# hippo_leap
 
-- {PROJECT_DESCRIPTION}
-- {PROJECT_FOCUS}
+- OpenAI-compatible LLM inference server in Nim.
+- Uses hippo for GPU compute, mummy for HTTP serving, openai_leap for API types.
 
 ## Dependencies
 
 - Nim >= 2.0.0
-- {PRIMARY_DEPENDENCY_DESCRIPTION}
-- {ADDITIONAL_DEPENDENCIES}
+- hippo for GPU (CUDA/HIP) operations
+- mummy for HTTP server
+- openai_leap for OpenAI-compatible API types
+- jsony for JSON serialization
+- curly for HTTP client operations
+- ws for WebSocket support
+
+## Build
+
+- Run `nimby sync -g nimby.lock` to install dependencies and generate nim.cfg
+- Run `make build` to compile the main binary
+- Run `make tools` to compile CLI tools
 
 ## Tests
 
-- Run `nimble test` to run all tests
-- Individual test files can be run individually `nim r tests/test_*.nim` 
-
-## Nim
+- Run `make test` to run all unit tests
+- Run `make integration-test` to run integration tests
+- Run `make e2e-test` to run end-to-end tests
+- Individual test files can be run with `nim r tests/test_*.nim`
 
 ## Nim best practices
 

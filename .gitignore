@@ -2,6 +2,7 @@
 *
 !*/
 !*.*
+!Makefile
 
 # normal ignores:
 *.exe
@@ -10,3 +11,6 @@ nimcache
 *.ilk
 *.out
 .*
+!.github
+nim.cfg
+*.log
