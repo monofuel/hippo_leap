@@ -880,6 +880,83 @@ when HippoWarpSize == 32:
     if tid == 0'i32:
       outArr[row] = acc
 
+  const Q6KBlockRowsPerBlock = 8
+
+  proc linearQ6KBlockDecodeKernel(
+    wData: ptr uint8,
+    xData, outData: ptr float32,
+    outRows, wCols: cint
+  ) {.hippoGlobal.} =
+    ## Block-based Q6_K GEMV. 256 threads (8 warps), 8 rows per block.
+    let tid = cint(threadIdx.x)
+    let warpId = tid shr 5'i32
+    let lane = tid and 31'i32
+    let baseRow = cint(blockIdx.x) * Q6KBlockRowsPerBlock
+    let row = baseRow + warpId
+    let w = cast[ptr UncheckedArray[uint8]](wData)
+    let xArr = cast[ptr UncheckedArray[float32]](xData)
+    let outArr = cast[ptr UncheckedArray[float32]](outData)
+    var sX {.hippoShared.}: array[2048, float32]
+    var i = tid
+    while i < wCols:
+      sX[i] = xArr[i]
+      i = i + 256'i32
+    hippoSyncthreads()
+    if row >= outRows:
+      return
+    let nBlocksPerRow = wCols div 256'i32
+    let rowSizeBytes = nBlocksPerRow * 210'i32
+    let rowBase = row * rowSizeBytes
+    var acc = 0.0'f32
+    var blkIdx = 0'i32
+    while blkIdx < nBlocksPerRow:
+      let bs = rowBase + blkIdx * 210'i32
+      let eb = blkIdx * 256'i32
+      let dRaw = uint16(w[bs + 208'i32]) or (uint16(w[bs + 209'i32]) shl 8)
+      let dAll = hippoHalfToFloat(dRaw)
+      let scBase = bs + 192'i32
+      let scHalf = lane shr 4'i32
+      block:
+        let qlA = w[bs + lane]
+        let qlB = w[bs + 32'i32 + lane]
+        let qhByte = w[bs + 128'i32 + lane]
+        let sc0 = cast[int8](w[scBase + scHalf])
+        let q1 = cint(qlA and 0x0F'u8) or (cint((qhByte shr 0'u8) and 3'u8) shl 4'i32) - 32'i32
+        acc = acc + dAll * cfloat(sc0) * cfloat(q1) * sX[eb + lane]
+        let sc1 = cast[int8](w[scBase + 2'i32 + scHalf])
+        let q2 = cint(qlB and 0x0F'u8) or (cint((qhByte shr 2'u8) and 3'u8) shl 4'i32) - 32'i32
+        acc = acc + dAll * cfloat(sc1) * cfloat(q2) * sX[eb + lane + 32'i32]
+        let sc2 = cast[int8](w[scBase + 4'i32 + scHalf])
+        let q3 = cint(qlA shr 4'u8) or (cint((qhByte shr 4'u8) and 3'u8) shl 4'i32) - 32'i32
+        acc = acc + dAll * cfloat(sc2) * cfloat(q3) * sX[eb + lane + 64'i32]
+        let sc3 = cast[int8](w[scBase + 6'i32 + scHalf])
+        let q4 = cint(qlB shr 4'u8) or (cint((qhByte shr 6'u8) and 3'u8) shl 4'i32) - 32'i32
+        acc = acc + dAll * cfloat(sc3) * cfloat(q4) * sX[eb + lane + 96'i32]
+      block:
+        let qlA = w[bs + 64'i32 + lane]
+        let qlB = w[bs + 64'i32 + 32'i32 + lane]
+        let qhByte = w[bs + 160'i32 + lane]
+        let sc0 = cast[int8](w[scBase + 8'i32 + scHalf])
+        let q1 = cint(qlA and 0x0F'u8) or (cint((qhByte shr 0'u8) and 3'u8) shl 4'i32) - 32'i32
+        acc = acc + dAll * cfloat(sc0) * cfloat(q1) * sX[eb + lane + 128'i32]
+        let sc1 = cast[int8](w[scBase + 10'i32 + scHalf])
+        let q2 = cint(qlB and 0x0F'u8) or (cint((qhByte shr 2'u8) and 3'u8) shl 4'i32) - 32'i32
+        acc = acc + dAll * cfloat(sc1) * cfloat(q2) * sX[eb + lane + 160'i32]
+        let sc2 = cast[int8](w[scBase + 12'i32 + scHalf])
+        let q3 = cint(qlA shr 4'u8) or (cint((qhByte shr 4'u8) and 3'u8) shl 4'i32) - 32'i32
+        acc = acc + dAll * cfloat(sc2) * cfloat(q3) * sX[eb + lane + 192'i32]
+        let sc3 = cast[int8](w[scBase + 14'i32 + scHalf])
+        let q4 = cint(qlB shr 4'u8) or (cint((qhByte shr 6'u8) and 3'u8) shl 4'i32) - 32'i32
+        acc = acc + dAll * cfloat(sc3) * cfloat(q4) * sX[eb + lane + 224'i32]
+      blkIdx = blkIdx + 1'i32
+    acc = acc + hippoShflDown(acc, 16)
+    acc = acc + hippoShflDown(acc, 8)
+    acc = acc + hippoShflDown(acc, 4)
+    acc = acc + hippoShflDown(acc, 2)
+    acc = acc + hippoShflDown(acc, 1)
+    if lane == 0'i32:
+      outArr[row] = acc
+
 proc gpuLinearColQ6K*(dst, x, wQuant: pointer, wCols, wRows: int,
                        stream: HippoStream) =
   when HippoWarpSize == 32:
@@ -1004,6 +1081,129 @@ when HippoWarpSize == 32:
     acc = acc + hippoShflDown(acc, 2)
     acc = acc + hippoShflDown(acc, 1)
     if tid == 0'i32:
+      outArr[row] = acc
+
+  const Q4KBlockRowsPerBlock = 8
+
+  proc linearQ4KBlockDecodeKernel(
+    wData: ptr uint8,
+    xData, outData: ptr float32,
+    outRows, wCols: cint
+  ) {.hippoGlobal.} =
+    ## Block-based Q4_K GEMV. 256 threads (8 warps), 8 rows per block.
+    ## Shared memory sized for wCols <= 2048.
+    let tid = cint(threadIdx.x)
+    let warpId = tid shr 5'i32
+    let lane = tid and 31'i32
+    let baseRow = cint(blockIdx.x) * Q4KBlockRowsPerBlock
+    let row = baseRow + warpId
+    let w = cast[ptr UncheckedArray[uint8]](wData)
+    let xArr = cast[ptr UncheckedArray[float32]](xData)
+    let outArr = cast[ptr UncheckedArray[float32]](outData)
+    var sX {.hippoShared.}: array[2048, float32]
+    var i = tid
+    while i < wCols:
+      sX[i] = xArr[i]
+      i = i + 256'i32
+    hippoSyncthreads()
+    if row >= outRows:
+      return
+    let nBlocksPerRow = wCols div 256'i32
+    let rowSizeBytes = nBlocksPerRow * 144'i32
+    let rowBase = row * rowSizeBytes
+    var acc = 0.0'f32
+    var blkIdx = 0'i32
+    while blkIdx < nBlocksPerRow:
+      let bs = rowBase + blkIdx * 144'i32
+      let eb = blkIdx * 256'i32
+      let dRaw = uint16(w[bs]) or (uint16(w[bs + 1'i32]) shl 8)
+      let dmRaw = uint16(w[bs + 2'i32]) or (uint16(w[bs + 3'i32]) shl 8)
+      let dAll = hippoHalfToFloat(dRaw)
+      let dMin = hippoHalfToFloat(dmRaw)
+      let scales = cast[ptr UncheckedArray[uint8]](addr w[bs + 4'i32])
+      let qs = cast[ptr UncheckedArray[uint8]](addr w[bs + 16'i32])
+      var isIdx = 0'i32
+      var qOff = 0'i32
+      for grp in countup(0'i32, 3'i32):
+        var sc0, mn0, sc1, mn1: uint8
+        getScaleMinK4Gpu(isIdx, scales, sc0, mn0)
+        let d1 = dAll * cfloat(sc0)
+        let m1 = dMin * cfloat(mn0)
+        getScaleMinK4Gpu(isIdx + 1'i32, scales, sc1, mn1)
+        let d2 = dAll * cfloat(sc1)
+        let m2 = dMin * cfloat(mn1)
+        let qByte = qs[qOff + lane]
+        acc = acc + (d1 * cfloat(qByte and 0x0F'u8) - m1) * sX[eb + grp * 64'i32 + lane]
+        acc = acc + (d2 * cfloat(qByte shr 4'u8) - m2) * sX[eb + grp * 64'i32 + 32'i32 + lane]
+        isIdx = isIdx + 2'i32
+        qOff = qOff + 32'i32
+      blkIdx = blkIdx + 1'i32
+    acc = acc + hippoShflDown(acc, 16)
+    acc = acc + hippoShflDown(acc, 8)
+    acc = acc + hippoShflDown(acc, 4)
+    acc = acc + hippoShflDown(acc, 2)
+    acc = acc + hippoShflDown(acc, 1)
+    if lane == 0'i32:
+      outArr[row] = acc
+
+  proc linearQ4KBlockWideDecodeKernel(
+    wData: ptr uint8,
+    xData, outData: ptr float32,
+    outRows, wCols: cint
+  ) {.hippoGlobal.} =
+    ## Block-based Q4_K GEMV for wide inputs (wCols > 2048, e.g. FFN down).
+    let tid = cint(threadIdx.x)
+    let warpId = tid shr 5'i32
+    let lane = tid and 31'i32
+    let baseRow = cint(blockIdx.x) * Q4KBlockRowsPerBlock
+    let row = baseRow + warpId
+    let w = cast[ptr UncheckedArray[uint8]](wData)
+    let xArr = cast[ptr UncheckedArray[float32]](xData)
+    let outArr = cast[ptr UncheckedArray[float32]](outData)
+    var sX {.hippoShared.}: array[8192, float32]
+    var i = tid
+    while i < wCols:
+      sX[i] = xArr[i]
+      i = i + 256'i32
+    hippoSyncthreads()
+    if row >= outRows:
+      return
+    let nBlocksPerRow = wCols div 256'i32
+    let rowSizeBytes = nBlocksPerRow * 144'i32
+    let rowBase = row * rowSizeBytes
+    var acc = 0.0'f32
+    var blkIdx = 0'i32
+    while blkIdx < nBlocksPerRow:
+      let bs = rowBase + blkIdx * 144'i32
+      let eb = blkIdx * 256'i32
+      let dRaw = uint16(w[bs]) or (uint16(w[bs + 1'i32]) shl 8)
+      let dmRaw = uint16(w[bs + 2'i32]) or (uint16(w[bs + 3'i32]) shl 8)
+      let dAll = hippoHalfToFloat(dRaw)
+      let dMin = hippoHalfToFloat(dmRaw)
+      let scales = cast[ptr UncheckedArray[uint8]](addr w[bs + 4'i32])
+      let qs = cast[ptr UncheckedArray[uint8]](addr w[bs + 16'i32])
+      var isIdx = 0'i32
+      var qOff = 0'i32
+      for grp in countup(0'i32, 3'i32):
+        var sc0, mn0, sc1, mn1: uint8
+        getScaleMinK4Gpu(isIdx, scales, sc0, mn0)
+        let d1 = dAll * cfloat(sc0)
+        let m1 = dMin * cfloat(mn0)
+        getScaleMinK4Gpu(isIdx + 1'i32, scales, sc1, mn1)
+        let d2 = dAll * cfloat(sc1)
+        let m2 = dMin * cfloat(mn1)
+        let qByte = qs[qOff + lane]
+        acc = acc + (d1 * cfloat(qByte and 0x0F'u8) - m1) * sX[eb + grp * 64'i32 + lane]
+        acc = acc + (d2 * cfloat(qByte shr 4'u8) - m2) * sX[eb + grp * 64'i32 + 32'i32 + lane]
+        isIdx = isIdx + 2'i32
+        qOff = qOff + 32'i32
+      blkIdx = blkIdx + 1'i32
+    acc = acc + hippoShflDown(acc, 16)
+    acc = acc + hippoShflDown(acc, 8)
+    acc = acc + hippoShflDown(acc, 4)
+    acc = acc + hippoShflDown(acc, 2)
+    acc = acc + hippoShflDown(acc, 1)
+    if lane == 0'i32:
       outArr[row] = acc
 
 proc gpuLinearColQ4K*(dst, x, wQuant: pointer, wCols, wRows: int,
@@ -1140,6 +1340,218 @@ proc gpuFusedGateUpSiluQ3K*(dst, x, gateQuant, upQuant: pointer,
                       args = hippoArgs(gPtr, uPtr, xPtr, dPtr, outRowsArg, wColsArg))
   else:
     {.error: "gpuFusedGateUpSiluQ3K requires WarpSize == 32".}
+
+# ---------------------------------------------------------------------------
+# Fused K+V for Q4_K (block-based, 8 rows/block)
+# ---------------------------------------------------------------------------
+when HippoWarpSize == 32:
+  proc fusedKVQ4KBlockKernel(
+    kData, vData: ptr uint8,
+    xData, kOut, vOut: ptr float32,
+    outRows, wCols: cint
+  ) {.hippoGlobal.} =
+    let tid = cint(threadIdx.x)
+    let warpId = tid shr 5'i32
+    let lane = tid and 31'i32
+    let baseRow = cint(blockIdx.x) * Q4KBlockRowsPerBlock
+    let row = baseRow + warpId
+    let kw = cast[ptr UncheckedArray[uint8]](kData)
+    let vw = cast[ptr UncheckedArray[uint8]](vData)
+    let xArr = cast[ptr UncheckedArray[float32]](xData)
+    let kArr = cast[ptr UncheckedArray[float32]](kOut)
+    let vArr = cast[ptr UncheckedArray[float32]](vOut)
+    var sX {.hippoShared.}: array[2048, float32]
+    var i = tid
+    while i < wCols:
+      sX[i] = xArr[i]
+      i = i + 256'i32
+    hippoSyncthreads()
+    if row >= outRows:
+      return
+    let nBlocksPerRow = wCols div 256'i32
+    let rowSizeBytes = nBlocksPerRow * 144'i32
+    let kRowBase = row * rowSizeBytes
+    let vRowBase = row * rowSizeBytes
+    var kAcc = 0.0'f32
+    var vAcc = 0.0'f32
+    var blkIdx = 0'i32
+    while blkIdx < nBlocksPerRow:
+      let kbs = kRowBase + blkIdx * 144'i32
+      let vbs = vRowBase + blkIdx * 144'i32
+      let eb = blkIdx * 256'i32
+      let kDRaw = uint16(kw[kbs]) or (uint16(kw[kbs + 1'i32]) shl 8)
+      let kDmRaw = uint16(kw[kbs + 2'i32]) or (uint16(kw[kbs + 3'i32]) shl 8)
+      let kDAll = hippoHalfToFloat(kDRaw)
+      let kDMin = hippoHalfToFloat(kDmRaw)
+      let kScales = cast[ptr UncheckedArray[uint8]](addr kw[kbs + 4'i32])
+      let kQs = cast[ptr UncheckedArray[uint8]](addr kw[kbs + 16'i32])
+      let vDRaw = uint16(vw[vbs]) or (uint16(vw[vbs + 1'i32]) shl 8)
+      let vDmRaw = uint16(vw[vbs + 2'i32]) or (uint16(vw[vbs + 3'i32]) shl 8)
+      let vDAll = hippoHalfToFloat(vDRaw)
+      let vDMin = hippoHalfToFloat(vDmRaw)
+      let vScales = cast[ptr UncheckedArray[uint8]](addr vw[vbs + 4'i32])
+      let vQs = cast[ptr UncheckedArray[uint8]](addr vw[vbs + 16'i32])
+      var isIdx = 0'i32
+      var qOff = 0'i32
+      for grp in countup(0'i32, 3'i32):
+        var kSc0, kMn0, kSc1, kMn1: uint8
+        getScaleMinK4Gpu(isIdx, kScales, kSc0, kMn0)
+        let kD1 = kDAll * cfloat(kSc0)
+        let kM1 = kDMin * cfloat(kMn0)
+        getScaleMinK4Gpu(isIdx + 1'i32, kScales, kSc1, kMn1)
+        let kD2 = kDAll * cfloat(kSc1)
+        let kM2 = kDMin * cfloat(kMn1)
+        var vSc0, vMn0, vSc1, vMn1: uint8
+        getScaleMinK4Gpu(isIdx, vScales, vSc0, vMn0)
+        let vD1 = vDAll * cfloat(vSc0)
+        let vM1 = vDMin * cfloat(vMn0)
+        getScaleMinK4Gpu(isIdx + 1'i32, vScales, vSc1, vMn1)
+        let vD2 = vDAll * cfloat(vSc1)
+        let vM2 = vDMin * cfloat(vMn1)
+        let kQByte = kQs[qOff + lane]
+        let vQByte = vQs[qOff + lane]
+        let xLo = sX[eb + grp * 64'i32 + lane]
+        let xHi = sX[eb + grp * 64'i32 + 32'i32 + lane]
+        kAcc = kAcc + (kD1 * cfloat(kQByte and 0x0F'u8) - kM1) * xLo
+        kAcc = kAcc + (kD2 * cfloat(kQByte shr 4'u8) - kM2) * xHi
+        vAcc = vAcc + (vD1 * cfloat(vQByte and 0x0F'u8) - vM1) * xLo
+        vAcc = vAcc + (vD2 * cfloat(vQByte shr 4'u8) - vM2) * xHi
+        isIdx = isIdx + 2'i32
+        qOff = qOff + 32'i32
+      blkIdx = blkIdx + 1'i32
+    kAcc = kAcc + hippoShflDown(kAcc, 16)
+    kAcc = kAcc + hippoShflDown(kAcc, 8)
+    kAcc = kAcc + hippoShflDown(kAcc, 4)
+    kAcc = kAcc + hippoShflDown(kAcc, 2)
+    kAcc = kAcc + hippoShflDown(kAcc, 1)
+    vAcc = vAcc + hippoShflDown(vAcc, 16)
+    vAcc = vAcc + hippoShflDown(vAcc, 8)
+    vAcc = vAcc + hippoShflDown(vAcc, 4)
+    vAcc = vAcc + hippoShflDown(vAcc, 2)
+    vAcc = vAcc + hippoShflDown(vAcc, 1)
+    if lane == 0'i32:
+      kArr[row] = kAcc
+      vArr[row] = vAcc
+
+proc gpuFusedKVLinearQ4K*(kDst, vDst, x, kQuant, vQuant: pointer,
+                            wCols, wRows: int, stream: HippoStream) =
+  when HippoWarpSize == 32:
+    let grid = newDim3(((wRows + Q4KBlockRowsPerBlock - 1) div Q4KBlockRowsPerBlock).uint32)
+    let blk = newDim3(HippoBlockSize.uint32)
+    var kPtr = kQuant; var vPtr = vQuant
+    var xPtr = x; var kDstP = kDst; var vDstP = vDst
+    var outRowsArg = wRows.cint; var wColsArg = wCols.cint
+    hippoLaunchKernel(fusedKVQ4KBlockKernel, gridDim = grid, blockDim = blk,
+                      stream = stream,
+                      args = hippoArgs(kPtr, vPtr, xPtr, kDstP, vDstP, outRowsArg, wColsArg))
+  else:
+    {.error: "gpuFusedKVLinearQ4K requires WarpSize == 32".}
+
+# ---------------------------------------------------------------------------
+# Fused Gate+Up+SiLU for Q4_K (block-based, 8 rows/block)
+# ---------------------------------------------------------------------------
+when HippoWarpSize == 32:
+  proc fusedGateUpSiluQ4KBlockKernel(
+    gateData, upData: ptr uint8,
+    xData, outData: ptr float32,
+    outRows, wCols: cint
+  ) {.hippoGlobal.} =
+    let tid = cint(threadIdx.x)
+    let warpId = tid shr 5'i32
+    let lane = tid and 31'i32
+    let baseRow = cint(blockIdx.x) * Q4KBlockRowsPerBlock
+    let row = baseRow + warpId
+    let gw = cast[ptr UncheckedArray[uint8]](gateData)
+    let uw = cast[ptr UncheckedArray[uint8]](upData)
+    let xArr = cast[ptr UncheckedArray[float32]](xData)
+    let outArr = cast[ptr UncheckedArray[float32]](outData)
+    var sX {.hippoShared.}: array[2048, float32]
+    var i = tid
+    while i < wCols:
+      sX[i] = xArr[i]
+      i = i + 256'i32
+    hippoSyncthreads()
+    if row >= outRows:
+      return
+    let nBlocksPerRow = wCols div 256'i32
+    let rowSizeBytes = nBlocksPerRow * 144'i32
+    let gRowBase = row * rowSizeBytes
+    let uRowBase = row * rowSizeBytes
+    var gateAcc = 0.0'f32
+    var upAcc = 0.0'f32
+    var blkIdx = 0'i32
+    while blkIdx < nBlocksPerRow:
+      let gbs = gRowBase + blkIdx * 144'i32
+      let ubs = uRowBase + blkIdx * 144'i32
+      let eb = blkIdx * 256'i32
+      let gDRaw = uint16(gw[gbs]) or (uint16(gw[gbs + 1'i32]) shl 8)
+      let gDmRaw = uint16(gw[gbs + 2'i32]) or (uint16(gw[gbs + 3'i32]) shl 8)
+      let gDAll = hippoHalfToFloat(gDRaw)
+      let gDMin = hippoHalfToFloat(gDmRaw)
+      let gScales = cast[ptr UncheckedArray[uint8]](addr gw[gbs + 4'i32])
+      let gQs = cast[ptr UncheckedArray[uint8]](addr gw[gbs + 16'i32])
+      let uDRaw = uint16(uw[ubs]) or (uint16(uw[ubs + 1'i32]) shl 8)
+      let uDmRaw = uint16(uw[ubs + 2'i32]) or (uint16(uw[ubs + 3'i32]) shl 8)
+      let uDAll = hippoHalfToFloat(uDRaw)
+      let uDMin = hippoHalfToFloat(uDmRaw)
+      let uScales = cast[ptr UncheckedArray[uint8]](addr uw[ubs + 4'i32])
+      let uQs = cast[ptr UncheckedArray[uint8]](addr uw[ubs + 16'i32])
+      var isIdx = 0'i32
+      var qOff = 0'i32
+      for grp in countup(0'i32, 3'i32):
+        var gSc0, gMn0, gSc1, gMn1: uint8
+        getScaleMinK4Gpu(isIdx, gScales, gSc0, gMn0)
+        let gD1 = gDAll * cfloat(gSc0)
+        let gM1 = gDMin * cfloat(gMn0)
+        getScaleMinK4Gpu(isIdx + 1'i32, gScales, gSc1, gMn1)
+        let gD2 = gDAll * cfloat(gSc1)
+        let gM2 = gDMin * cfloat(gMn1)
+        var uSc0, uMn0, uSc1, uMn1: uint8
+        getScaleMinK4Gpu(isIdx, uScales, uSc0, uMn0)
+        let uD1 = uDAll * cfloat(uSc0)
+        let uM1 = uDMin * cfloat(uMn0)
+        getScaleMinK4Gpu(isIdx + 1'i32, uScales, uSc1, uMn1)
+        let uD2 = uDAll * cfloat(uSc1)
+        let uM2 = uDMin * cfloat(uMn1)
+        let gQByte = gQs[qOff + lane]
+        let uQByte = uQs[qOff + lane]
+        let xLo = sX[eb + grp * 64'i32 + lane]
+        let xHi = sX[eb + grp * 64'i32 + 32'i32 + lane]
+        gateAcc = gateAcc + (gD1 * cfloat(gQByte and 0x0F'u8) - gM1) * xLo
+        gateAcc = gateAcc + (gD2 * cfloat(gQByte shr 4'u8) - gM2) * xHi
+        upAcc = upAcc + (uD1 * cfloat(uQByte and 0x0F'u8) - uM1) * xLo
+        upAcc = upAcc + (uD2 * cfloat(uQByte shr 4'u8) - uM2) * xHi
+        isIdx = isIdx + 2'i32
+        qOff = qOff + 32'i32
+      blkIdx = blkIdx + 1'i32
+    gateAcc = gateAcc + hippoShflDown(gateAcc, 16)
+    gateAcc = gateAcc + hippoShflDown(gateAcc, 8)
+    gateAcc = gateAcc + hippoShflDown(gateAcc, 4)
+    gateAcc = gateAcc + hippoShflDown(gateAcc, 2)
+    gateAcc = gateAcc + hippoShflDown(gateAcc, 1)
+    upAcc = upAcc + hippoShflDown(upAcc, 16)
+    upAcc = upAcc + hippoShflDown(upAcc, 8)
+    upAcc = upAcc + hippoShflDown(upAcc, 4)
+    upAcc = upAcc + hippoShflDown(upAcc, 2)
+    upAcc = upAcc + hippoShflDown(upAcc, 1)
+    if lane == 0'i32:
+      let g = gateAcc
+      let sigmoid = 1.0'f32 / (1.0'f32 + expf(-g))
+      outArr[row] = g * sigmoid * upAcc
+
+proc gpuFusedGateUpSiluQ4K*(dst, x, gateQuant, upQuant: pointer,
+                              wCols, wRows: int, stream: HippoStream) =
+  when HippoWarpSize == 32:
+    let grid = newDim3(((wRows + Q4KBlockRowsPerBlock - 1) div Q4KBlockRowsPerBlock).uint32)
+    let blk = newDim3(HippoBlockSize.uint32)
+    var gPtr = gateQuant; var uPtr = upQuant
+    var xPtr = x; var dPtr = dst
+    var outRowsArg = wRows.cint; var wColsArg = wCols.cint
+    hippoLaunchKernel(fusedGateUpSiluQ4KBlockKernel, gridDim = grid, blockDim = blk,
+                      stream = stream,
+                      args = hippoArgs(gPtr, uPtr, xPtr, dPtr, outRowsArg, wColsArg))
+  else:
+    {.error: "gpuFusedGateUpSiluQ4K requires WarpSize == 32".}
 
 # ---------------------------------------------------------------------------
 # Elementwise kernels
@@ -2067,7 +2479,9 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
     else:
       gpuLinearCol(tmp0, xNormPtr, lw.wq, hp.nEmb, hp.nEmb, 1, stream)
     when HippoWarpSize == 32:
-      if lw.wkQ != nil and lw.wvQ != nil and lw.wkQType == GgmlTypeQ2K and lw.wvQType == GgmlTypeQ3K:
+      if lw.wkQ != nil and lw.wvQ != nil and lw.wkQType == GgmlTypeQ4K and lw.wvQType == GgmlTypeQ4K:
+        gpuFusedKVLinearQ4K(tmp1, tmp2, xNormPtr, lw.wkQ, lw.wvQ, hp.nEmb, kvDim, stream)
+      elif lw.wkQ != nil and lw.wvQ != nil and lw.wkQType == GgmlTypeQ2K and lw.wvQType == GgmlTypeQ3K:
         gpuFusedKVLinearQ2KQ3K(tmp1, tmp2, xNormPtr, lw.wkQ, lw.wvQ, hp.nEmb, kvDim, stream)
       else:
         if lw.wkQ != nil:
@@ -2119,7 +2533,10 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
       recordStop(eventPairs, stream)
       recordStart(eventPairs, KcLinearGateUp, stream)
     when HippoWarpSize == 32:
-      if lw.wGateQType == GgmlTypeQ3K and lw.wUpQType == GgmlTypeQ3K:
+      if lw.wGateQType == GgmlTypeQ4K and lw.wUpQType == GgmlTypeQ4K:
+        gpuFusedGateUpSiluQ4K(tmp2, xNormPtr, lw.wGateQ, lw.wUpQ,
+                              hp.nEmb, hp.nFfn, stream)
+      elif lw.wGateQType == GgmlTypeQ3K and lw.wUpQType == GgmlTypeQ3K:
         gpuFusedGateUpSiluQ3K(tmp2, xNormPtr, lw.wGateQ, lw.wUpQ,
                               hp.nEmb, hp.nFfn, stream)
       else:
