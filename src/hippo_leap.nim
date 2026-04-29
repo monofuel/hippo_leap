@@ -1,12 +1,15 @@
 import
   std/[os, strformat],
-  ./hippo_leap/[common, config, server]
+  ./hippo_leap/[common, config, server, cmd_chat, cmd_bench, cmd_tokenize]
 
 const
   Usage = """hippo_leap - OpenAI-compatible LLM inference server
 
 Usage:
   hippo_leap serve           Start the inference server
+  hippo_leap chat            Interactive chat REPL
+  hippo_leap bench           Run inference benchmarks
+  hippo_leap tokenize <text> Show tokenization of text
   hippo_leap --version       Print version
   hippo_leap --help          Show this help
 
@@ -37,6 +40,12 @@ when isMainModule:
   case args[0]
   of "serve":
     cmdServe()
+  of "chat":
+    cmdChat(args[1..^1])
+  of "bench":
+    cmdBench(args[1..^1])
+  of "tokenize":
+    cmdTokenize(args[1..^1])
   of "--version":
     echo Version
   of "--help", "-h":
