@@ -1554,6 +1554,216 @@ proc gpuFusedGateUpSiluQ4K*(dst, x, gateQuant, upQuant: pointer,
     {.error: "gpuFusedGateUpSiluQ4K requires WarpSize == 32".}
 
 # ---------------------------------------------------------------------------
+# GPU argmax kernels — fixed 256-block grid so pass 2 fits in one block
+# ---------------------------------------------------------------------------
+proc argmaxPass1Kernel(
+  data: ptr float32,
+  scratchVals: ptr float32,
+  scratchIdxs: ptr cint,
+  n: cint
+) {.hippoGlobal.} =
+  var sVal {.hippoShared.}: array[HippoBlockSize, float32]
+  var sIdx {.hippoShared.}: array[HippoBlockSize, cint]
+  let tid = int(threadIdx.x)
+  let d = cast[ptr UncheckedArray[float32]](data)
+  let stride = int(gridDim.x) * HippoBlockSize
+  var gid = int(blockIdx.x) * HippoBlockSize + tid
+  var bestVal = -3.4e38'f32
+  var bestIdx = -1'i32
+  while gid < int(n):
+    let v = d[gid]
+    if v > bestVal:
+      bestVal = v
+      bestIdx = cint(gid)
+    gid = gid + stride
+  sVal[tid] = bestVal
+  sIdx[tid] = bestIdx
+  hippoSyncthreads()
+  when HippoBlockSize == 256:
+    if tid < 128:
+      if sVal[tid + 128] > sVal[tid]:
+        sVal[tid] = sVal[tid + 128]
+        sIdx[tid] = sIdx[tid + 128]
+    hippoSyncthreads()
+    if tid < 64:
+      if sVal[tid + 64] > sVal[tid]:
+        sVal[tid] = sVal[tid + 64]
+        sIdx[tid] = sIdx[tid + 64]
+    hippoSyncthreads()
+  when HippoWarpSize == 64:
+    if tid < HippoWarpSize:
+      var val = sVal[tid]
+      var idx = sIdx[tid]
+      var otherVal = hippoShflDown(val, 32)
+      var otherIdx = hippoShflDown(idx, 32)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 16)
+      otherIdx = hippoShflDown(idx, 16)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 8)
+      otherIdx = hippoShflDown(idx, 8)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 4)
+      otherIdx = hippoShflDown(idx, 4)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 2)
+      otherIdx = hippoShflDown(idx, 2)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 1)
+      otherIdx = hippoShflDown(idx, 1)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      if tid == 0:
+        let sv = cast[ptr UncheckedArray[float32]](scratchVals)
+        let si = cast[ptr UncheckedArray[cint]](scratchIdxs)
+        sv[int(blockIdx.x)] = val
+        si[int(blockIdx.x)] = idx
+  elif HippoWarpSize == 32:
+    if tid < 32:
+      if sVal[tid + 32] > sVal[tid]:
+        sVal[tid] = sVal[tid + 32]
+        sIdx[tid] = sIdx[tid + 32]
+    hippoSyncthreads()
+    if tid < HippoWarpSize:
+      var val = sVal[tid]
+      var idx = sIdx[tid]
+      var otherVal = hippoShflDown(val, 16)
+      var otherIdx = hippoShflDown(idx, 16)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 8)
+      otherIdx = hippoShflDown(idx, 8)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 4)
+      otherIdx = hippoShflDown(idx, 4)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 2)
+      otherIdx = hippoShflDown(idx, 2)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 1)
+      otherIdx = hippoShflDown(idx, 1)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      if tid == 0:
+        let sv = cast[ptr UncheckedArray[float32]](scratchVals)
+        let si = cast[ptr UncheckedArray[cint]](scratchIdxs)
+        sv[int(blockIdx.x)] = val
+        si[int(blockIdx.x)] = idx
+
+proc argmaxPass2Kernel(
+  scratchVals: ptr float32,
+  scratchIdxs: ptr cint,
+  resultIdx: ptr cint,
+  nBlocks: cint
+) {.hippoGlobal.} =
+  var sVal {.hippoShared.}: array[HippoBlockSize, float32]
+  var sIdx {.hippoShared.}: array[HippoBlockSize, cint]
+  let tid = int(threadIdx.x)
+  let sv = cast[ptr UncheckedArray[float32]](scratchVals)
+  let si = cast[ptr UncheckedArray[cint]](scratchIdxs)
+  if tid < int(nBlocks):
+    sVal[tid] = sv[tid]
+    sIdx[tid] = si[tid]
+  else:
+    sVal[tid] = -3.4e38'f32
+    sIdx[tid] = -1'i32
+  hippoSyncthreads()
+  when HippoBlockSize == 256:
+    if tid < 128:
+      if sVal[tid + 128] > sVal[tid]:
+        sVal[tid] = sVal[tid + 128]
+        sIdx[tid] = sIdx[tid + 128]
+    hippoSyncthreads()
+    if tid < 64:
+      if sVal[tid + 64] > sVal[tid]:
+        sVal[tid] = sVal[tid + 64]
+        sIdx[tid] = sIdx[tid + 64]
+    hippoSyncthreads()
+  when HippoWarpSize == 64:
+    if tid < HippoWarpSize:
+      var val = sVal[tid]
+      var idx = sIdx[tid]
+      var otherVal = hippoShflDown(val, 32)
+      var otherIdx = hippoShflDown(idx, 32)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 16)
+      otherIdx = hippoShflDown(idx, 16)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 8)
+      otherIdx = hippoShflDown(idx, 8)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 4)
+      otherIdx = hippoShflDown(idx, 4)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 2)
+      otherIdx = hippoShflDown(idx, 2)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 1)
+      otherIdx = hippoShflDown(idx, 1)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      if tid == 0:
+        cast[ptr cint](resultIdx)[] = idx
+  elif HippoWarpSize == 32:
+    if tid < 32:
+      if sVal[tid + 32] > sVal[tid]:
+        sVal[tid] = sVal[tid + 32]
+        sIdx[tid] = sIdx[tid + 32]
+    hippoSyncthreads()
+    if tid < HippoWarpSize:
+      var val = sVal[tid]
+      var idx = sIdx[tid]
+      var otherVal = hippoShflDown(val, 16)
+      var otherIdx = hippoShflDown(idx, 16)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 8)
+      otherIdx = hippoShflDown(idx, 8)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 4)
+      otherIdx = hippoShflDown(idx, 4)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 2)
+      otherIdx = hippoShflDown(idx, 2)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      otherVal = hippoShflDown(val, 1)
+      otherIdx = hippoShflDown(idx, 1)
+      if otherVal > val: val = otherVal; idx = otherIdx
+      if tid == 0:
+        cast[ptr cint](resultIdx)[] = idx
+
+const ArgmaxGridBlocks = HippoBlockSize
+
+proc ensureArgmaxBuffers() =
+  if gpuCtx.argmaxScratch.sizeBytes < ArgmaxGridBlocks * (sizeof(float32) + sizeof(cint)):
+    let nElems = ArgmaxGridBlocks * 2
+    gpuCtx.argmaxScratch = newGpuTensor(@[nElems])
+  if gpuCtx.argmaxResult.sizeBytes < sizeof(cint):
+    let alloc = hippoMalloc(sizeof(cint))
+    gpuCtx.argmaxResult = GpuTensor(
+      devicePtr: alloc.p, alloc: alloc,
+      shape: @[1], sizeBytes: sizeof(cint))
+
+proc gpuArgmax*(logitsPtr: pointer, nVocab: int, stream: HippoStream): int32 =
+  ensureArgmaxBuffers()
+  let scratchVals = gpuCtx.argmaxScratch.devicePtr
+  let scratchIdxs = cast[pointer](cast[uint](scratchVals) + uint(ArgmaxGridBlocks * sizeof(float32)))
+  let resultPtr = gpuCtx.argmaxResult.devicePtr
+  var grid1 = newDim3(ArgmaxGridBlocks.uint32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var lPtr = logitsPtr
+  var svPtr = scratchVals; var siPtr = scratchIdxs
+  var n = nVocab.cint
+  hippoLaunchKernel(argmaxPass1Kernel, gridDim = grid1, blockDim = blk,
+                    stream = stream,
+                    args = hippoArgs(lPtr, svPtr, siPtr, n))
+  var grid2 = newDim3(1'u32)
+  var rPtr = resultPtr
+  var nb = ArgmaxGridBlocks.cint
+  hippoLaunchKernel(argmaxPass2Kernel, gridDim = grid2, blockDim = blk,
+                    stream = stream,
+                    args = hippoArgs(svPtr, siPtr, rPtr, nb))
+  var hostResult: cint
+  gpuDownloadFromDevice(addr hostResult, resultPtr, sizeof(cint), stream)
+  gpuStreamSync(stream)
+  return int32(hostResult)
+
+# ---------------------------------------------------------------------------
 # Elementwise kernels
 # ---------------------------------------------------------------------------
 proc addKernel(aData, bData, outData: ptr float32, n: cint) {.hippoGlobal.} =
@@ -2622,5 +2832,135 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
     hippoEventDestroy(gpuStartEvt)
     hippoEventDestroy(gpuEndEvt)
 
+  cache.curLen = pos + 1
+  cache.gpuCache.curLen = cache.curLen
+
+proc forwardDecodeToken*(m: var Model, token: int32, cache: var KvCache): int32 =
+  ## Run single-token decode and return argmax token ID without downloading logits.
+  let hp = m.hparams
+  if hp.arch != "" and hp.arch != "llama":
+    raise newException(ValueError, "unsupported architecture: " & hp.arch)
+  if hp.nHeadKv != 0 and (hp.nHead mod hp.nHeadKv) != 0:
+    raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
+  if cache.curLen >= cache.maxLen:
+    raise newException(ValueError, "KV cache full")
+
+  let headDim = hp.nEmb div hp.nHead
+  let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
+  let kvDim = hp.nHeadKv * headDim
+  let pos = cache.curLen
+
+  ensureGpuContext()
+  let maxRows = max(max(hp.nEmb, hp.nFfn), hp.nVocab)
+  ensureActivationBuffers(maxRows)
+  ensureScratchBuffers(maxRows)
+  let stream = gpuCtx.stream
+
+  ensureModelGpuPtrs(m, hp)
+
+  var tok = token
+  let tokenPtr = gpuUploadInt32Pooled(unsafeAddr tok, 1, stream)
+
+  var xPtr = gpuCtx.act0.devicePtr
+  let xNormPtr = gpuCtx.act1.devicePtr
+  let tmp0 = gpuCtx.scratch0.devicePtr
+  let tmp1 = gpuCtx.scratch1.devicePtr
+  let tmp2 = gpuCtx.scratch2.devicePtr
+
+  gpuEmbedding(xPtr, modelPtrs.tokEmb, cast[ptr int32](tokenPtr),
+               hp.nEmb, 1, hp.nVocab, stream)
+
+  gpuRmsnormCols(xNormPtr, xPtr, modelPtrs.layers[0].attnNorm, hp.nEmb, 1, hp.rmsEps, stream)
+
+  for layer in 0 ..< hp.nLayer:
+    let lw = modelPtrs.layers[layer]
+
+    if lw.wqQ != nil:
+      gpuLinearColQuant(tmp0, xNormPtr, lw.wqQ, hp.nEmb, hp.nEmb, lw.wqQType, stream)
+    else:
+      gpuLinearCol(tmp0, xNormPtr, lw.wq, hp.nEmb, hp.nEmb, 1, stream)
+    when HippoWarpSize == 32:
+      if lw.wkQ != nil and lw.wvQ != nil and lw.wkQType == GgmlTypeQ4K and lw.wvQType == GgmlTypeQ4K:
+        gpuFusedKVLinearQ4K(tmp1, tmp2, xNormPtr, lw.wkQ, lw.wvQ, hp.nEmb, kvDim, stream)
+      elif lw.wkQ != nil and lw.wvQ != nil and lw.wkQType == GgmlTypeQ2K and lw.wvQType == GgmlTypeQ3K:
+        gpuFusedKVLinearQ2KQ3K(tmp1, tmp2, xNormPtr, lw.wkQ, lw.wvQ, hp.nEmb, kvDim, stream)
+      else:
+        if lw.wkQ != nil:
+          gpuLinearColQuant(tmp1, xNormPtr, lw.wkQ, hp.nEmb, kvDim, lw.wkQType, stream)
+        else:
+          gpuLinearCol(tmp1, xNormPtr, lw.wk, hp.nEmb, kvDim, 1, stream)
+        if lw.wvQ != nil:
+          gpuLinearColQuant(tmp2, xNormPtr, lw.wvQ, hp.nEmb, kvDim, lw.wvQType, stream)
+        else:
+          gpuLinearCol(tmp2, xNormPtr, lw.wv, hp.nEmb, kvDim, 1, stream)
+    else:
+      if lw.wkQ != nil:
+        gpuLinearColQuant(tmp1, xNormPtr, lw.wkQ, hp.nEmb, kvDim, lw.wkQType, stream)
+      else:
+        gpuLinearCol(tmp1, xNormPtr, lw.wk, hp.nEmb, kvDim, 1, stream)
+      if lw.wvQ != nil:
+        gpuLinearColQuant(tmp2, xNormPtr, lw.wvQ, hp.nEmb, kvDim, lw.wvQType, stream)
+      else:
+        gpuLinearCol(tmp2, xNormPtr, lw.wv, hp.nEmb, kvDim, 1, stream)
+    gpuRopeQKDecode(tmp0, tmp1, hp.nHead, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, pos, stream)
+    gpuStoreKVPair(cache.gpuCache.k[layer].devicePtr, tmp1,
+                    cache.gpuCache.v[layer].devicePtr, tmp2,
+                    kvDim, 1, cache.gpuCache.maxLen, pos, stream)
+    gpuAttentionDecode(xNormPtr, tmp0, cache.gpuCache.k[layer].devicePtr,
+                       cache.gpuCache.v[layer].devicePtr,
+                       hp.nHead, hp.nHeadKv, headDim, pos + 1,
+                       cache.gpuCache.maxLen, stream)
+    if lw.woQ != nil:
+      gpuLinearColQuant(tmp0, xNormPtr, lw.woQ, hp.nEmb, hp.nEmb, lw.woQType, stream)
+    else:
+      gpuLinearCol(tmp0, xNormPtr, lw.wo, hp.nEmb, hp.nEmb, 1, stream)
+    gpuResidualRmsnorm(xNormPtr, xPtr, tmp0, lw.ffnNorm, hp.nEmb, hp.rmsEps, stream)
+    when HippoWarpSize == 32:
+      if lw.wGateQType == GgmlTypeQ4K and lw.wUpQType == GgmlTypeQ4K:
+        gpuFusedGateUpSiluQ4K(tmp2, xNormPtr, lw.wGateQ, lw.wUpQ,
+                              hp.nEmb, hp.nFfn, stream)
+      elif lw.wGateQType == GgmlTypeQ3K and lw.wUpQType == GgmlTypeQ3K:
+        gpuFusedGateUpSiluQ3K(tmp2, xNormPtr, lw.wGateQ, lw.wUpQ,
+                              hp.nEmb, hp.nFfn, stream)
+      else:
+        if lw.wGateQ != nil:
+          gpuLinearColQuant(tmp0, xNormPtr, lw.wGateQ, hp.nEmb, hp.nFfn, lw.wGateQType, stream)
+        else:
+          gpuLinearCol(tmp0, xNormPtr, lw.wGate, hp.nEmb, hp.nFfn, 1, stream)
+        if lw.wUpQ != nil:
+          gpuLinearColQuant(tmp1, xNormPtr, lw.wUpQ, hp.nEmb, hp.nFfn, lw.wUpQType, stream)
+        else:
+          gpuLinearCol(tmp1, xNormPtr, lw.wUp, hp.nEmb, hp.nFfn, 1, stream)
+        gpuSiluMul(tmp2, tmp0, tmp1, hp.nFfn, stream)
+    else:
+      if lw.wGateQ != nil:
+        gpuLinearColQuant(tmp0, xNormPtr, lw.wGateQ, hp.nEmb, hp.nFfn, lw.wGateQType, stream)
+      else:
+        gpuLinearCol(tmp0, xNormPtr, lw.wGate, hp.nEmb, hp.nFfn, 1, stream)
+      if lw.wUpQ != nil:
+        gpuLinearColQuant(tmp1, xNormPtr, lw.wUpQ, hp.nEmb, hp.nFfn, lw.wUpQType, stream)
+      else:
+        gpuLinearCol(tmp1, xNormPtr, lw.wUp, hp.nEmb, hp.nFfn, 1, stream)
+      gpuSiluMul(tmp2, tmp0, tmp1, hp.nFfn, stream)
+    if lw.wDownQ != nil:
+      gpuLinearColQuant(tmp0, tmp2, lw.wDownQ, hp.nFfn, hp.nEmb, lw.wDownQType, stream)
+    else:
+      gpuLinearCol(tmp0, tmp2, lw.wDown, hp.nFfn, hp.nEmb, 1, stream)
+    if layer < hp.nLayer - 1:
+      gpuResidualRmsnorm(xNormPtr, xPtr, tmp0,
+                          modelPtrs.layers[layer + 1].attnNorm,
+                          hp.nEmb, hp.rmsEps, stream)
+    else:
+      gpuAdd(xPtr, xPtr, tmp0, hp.nEmb, stream)
+
+  gpuRmsnormCols(xNormPtr, xPtr, modelPtrs.normWeight, hp.nEmb, 1, hp.rmsEps, stream)
+  if modelPtrs.outputWeightQ != nil:
+    gpuLinearColQuant(xPtr, xNormPtr, modelPtrs.outputWeightQ,
+                      modelPtrs.outputShape0, modelPtrs.outputShape1,
+                      modelPtrs.outputQType, stream)
+  else:
+    gpuLinearCol(xPtr, xNormPtr, modelPtrs.outputWeight, modelPtrs.outputShape0, modelPtrs.outputShape1, 1, stream)
+
+  result = gpuArgmax(xPtr, modelPtrs.outputShape1, stream)
   cache.curLen = pos + 1
   cache.gpuCache.curLen = cache.curLen

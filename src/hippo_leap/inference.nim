@@ -77,8 +77,7 @@ proc generate*(ctx: var InferenceContext, text: string, maxTokens: int): Generat
   for i in 1 ..< maxGen:
     if nextToken in ctx.vocab.stopTokenIds:
       break
-    logits = forwardDecode(ctx.model, nextToken, ctx.cache)
-    nextToken = argmaxLast(logits, hp.nVocab)
+    nextToken = forwardDecodeToken(ctx.model, nextToken, ctx.cache)
     generated.add(nextToken)
 
   let t1 = epochTime()
