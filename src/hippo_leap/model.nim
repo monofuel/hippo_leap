@@ -1,0 +1,125 @@
+## Minimal model loader that reads GGUF tensors into float32.
+
+import
+  std/[tables],
+  ./[gguf_loader, tensor, quant]
+
+when cpuEndian != littleEndian:
+  import std/endians
+
+const
+  GgmlTypeF32* = 0
+  GgmlTypeF16* = 1
+  GgmlTypeQ2K* = 10
+  GgmlTypeQ3K* = 11
+  GgmlTypeQ6K* = 14
+
+type
+  HParams* = object
+    arch*: string
+    nVocab*: int
+    nCtx*: int
+    nEmb*: int
+    nLayer*: int
+    nFfn*: int
+    nHead*: int
+    nHeadKv*: int
+    ropeDim*: int
+    ropeFreqBase*: float32
+    rmsEps*: float32
+
+  Model* = object
+    hparams*: HParams
+    gguf*: GgufFile
+    infos*: Table[string, GgufTensorInfo]
+    cache*: Table[string, Tensor]
+
+proc tensorElemCount*(info: GgufTensorInfo): int =
+  ## Compute the total number of elements in a tensor.
+  var n = 1'u64
+  for i in 0 ..< int(info.nDims):
+    n *= info.ne[i]
+  if n > uint64(high(int)):
+    raise newException(ValueError, "tensor too large")
+  int(n)
+
+proc tensorShape(info: GgufTensorInfo): seq[int] =
+  result = newSeq[int](int(info.nDims))
+  for i in 0 ..< int(info.nDims):
+    result[i] = int(info.ne[i])
+
+proc loadTensorF32(g: GgufFile, info: GgufTensorInfo): Tensor =
+  let count = tensorElemCount(info)
+  result = newTensor(tensorShape(info))
+  let dataPtr = tensorDataPtr(g, info)
+  let rowLen = int(info.ne[0])
+  let rows = if rowLen > 0: count div rowLen else: 0
+  case info.elemType
+  of GgmlTypeF32:
+    copyMem(addr result.data[0], addr dataPtr[0], count * 4)
+  of GgmlTypeF16:
+    for i in 0 ..< count:
+      var u = cast[ptr UncheckedArray[uint16]](addr dataPtr[i * 2])[0]
+      when cpuEndian != littleEndian:
+        u = swapEndian(u)
+      result.data[i] = halfToFloat(u)
+  of GgmlTypeQ2K:
+    let rowSize = rowSizeQ2K(rowLen)
+    for r in 0 ..< rows:
+      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
+      let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
+      dequantRowQ2K(src, dst, rowLen)
+  of GgmlTypeQ3K:
+    let rowSize = rowSizeQ3K(rowLen)
+    for r in 0 ..< rows:
+      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
+      let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
+      dequantRowQ3K(src, dst, rowLen)
+  of GgmlTypeQ6K:
+    let rowSize = rowSizeQ6K(rowLen)
+    for r in 0 ..< rows:
+      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
+      let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
+      dequantRowQ6K(src, dst, rowLen)
+  else:
+    raise newException(ValueError, "unsupported ggml type: " & $info.elemType)
+
+proc loadHParams(g: GgufFile): HParams =
+  discard g.getKvStr("general.architecture", result.arch)
+  var v: uint32
+  if g.getKvU32("llama.vocab_size", v): result.nVocab = int(v)
+  if g.getKvU32("llama.context_length", v): result.nCtx = int(v)
+  if g.getKvU32("llama.embedding_length", v): result.nEmb = int(v)
+  if g.getKvU32("llama.block_count", v): result.nLayer = int(v)
+  if g.getKvU32("llama.feed_forward_length", v): result.nFfn = int(v)
+  if g.getKvU32("llama.attention.head_count", v): result.nHead = int(v)
+  if g.getKvU32("llama.attention.head_count_kv", v): result.nHeadKv = int(v)
+  if g.getKvU32("llama.rope.dimension_count", v): result.ropeDim = int(v)
+  var f: float32
+  if g.getKvF32("llama.rope.freq_base", f): result.ropeFreqBase = f
+  if g.getKvF32("llama.attention.layer_norm_rms_epsilon", f): result.rmsEps = f
+  if result.nVocab == 0:
+    var tokens: seq[string]
+    if g.getKvArrStr("tokenizer.ggml.tokens", tokens):
+      result.nVocab = tokens.len
+
+proc loadModel*(path: string): Model =
+  ## Load a GGUF model file and parse its hyperparameters and tensor index.
+  result.gguf = openGguf(path)
+  result.hparams = loadHParams(result.gguf)
+  result.infos = initTable[string, GgufTensorInfo](result.gguf.tensors.len * 2)
+  result.cache = initTable[string, Tensor]()
+  for info in result.gguf.tensors:
+    result.infos[info.name] = info
+
+proc close*(m: var Model) =
+  ## Close the underlying GGUF memory-mapped file.
+  m.gguf.close()
+
+proc getTensor*(m: var Model, name: string): lent Tensor =
+  ## Get a tensor by name, lazily dequantizing from the GGUF file on first access.
+  if not m.cache.hasKey(name):
+    if not m.infos.hasKey(name):
+      raise newException(KeyError, "missing tensor: " & name)
+    m.cache[name] = loadTensorF32(m.gguf, m.infos[name])
+  m.cache[name]

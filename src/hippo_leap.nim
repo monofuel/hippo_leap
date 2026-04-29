@@ -8,11 +8,23 @@ const
 Usage:
   hippo_leap serve           Start the inference server
   hippo_leap --version       Print version
-  hippo_leap --help          Show this help"""
+  hippo_leap --help          Show this help
+
+Environment:
+  HIPPO_LEAP_MODEL           Path to GGUF model file (required for inference)
+  HIPPO_LEAP_PORT            Server port (default: 8080)
+  HIPPO_LEAP_ADDRESS         Bind address (default: 0.0.0.0)
+  HIPPO_LEAP_MAX_TOKENS      Default max tokens per response (default: 256)
+  HIPPO_LEAP_MAX_CONTEXT     Max context length (default: 2048)"""
 
 proc cmdServe() =
   ## Start the HTTP inference server.
   let cfg = loadConfig()
+  if cfg.modelPath.len == 0:
+    echo "WARNING: HIPPO_LEAP_MODEL not set. Server will start without inference."
+  elif not fileExists(cfg.modelPath):
+    echo &"Error: model file not found: {cfg.modelPath}"
+    quit(1)
   runServer(cfg)
 
 when isMainModule:

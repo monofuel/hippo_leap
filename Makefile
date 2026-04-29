@@ -3,16 +3,18 @@
 nim.cfg: nimby.lock
 	nimby sync -g nimby.lock
 
-build: nim.cfg hippo_leap
+# GPU build with naive backend (default)
+NIM_GPU_FLAGS ?= --cc:hipcc -d:useMalloc -d:backendNaive -d:zippyNoSimd
 
-hippo_leap: src/hippo_leap.nim
-	nim c -o:hippo_leap src/hippo_leap.nim
+build: nim.cfg
+	nim cpp $(NIM_GPU_FLAGS) -o:hippo_leap src/hippo_leap.nim
 
 tools: nim.cfg
 	nim c -o:health_check src/tools/health_check.nim
 
 NIM_TEST_FLAGS ?= --hints:off --warnings:off
 
+# CPU-only unit tests (no GPU needed)
 test: nim.cfg
 	@files=$$(ls tests/test_*.nim 2>/dev/null); \
 	if [ -z "$$files" ]; then \
@@ -30,6 +32,7 @@ test: nim.cfg
 	done; \
 	exit $$fail
 
+# GPU integration tests (requires nim cpp + hipcc)
 integration-test: nim.cfg
 	@export TMPDIR=/dev/shm; \
 	files=$$(ls tests/integration_*.nim 2>/dev/null); \
@@ -40,7 +43,7 @@ integration-test: nim.cfg
 	fail=0; \
 	pids=""; \
 	for f in $$files; do \
-		( nim r $(NIM_TEST_FLAGS) "$$f" 2>&1 | sed "s|^|[$$f] |" ) & \
+		( nim cpp $(NIM_GPU_FLAGS) $(NIM_TEST_FLAGS) --run "$$f" 2>&1 | sed "s|^|[$$f] |" ) & \
 		pids="$$pids $$!"; \
 	done; \
 	for pid in $$pids; do \
