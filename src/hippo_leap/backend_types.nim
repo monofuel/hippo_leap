@@ -72,3 +72,5 @@ type
     scratchCapBytes*: int
     argmaxScratch*: GpuTensor
     argmaxResult*: GpuTensor
+    attnScratch*: GpuTensor
+    attnScratchBytes*: int

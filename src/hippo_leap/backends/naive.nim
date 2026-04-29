@@ -2078,11 +2078,15 @@ proc gpuStoreKVPair*(kCache, kSrc, vCache, vSrc: pointer,
 # ---------------------------------------------------------------------------
 # Attention kernels
 # ---------------------------------------------------------------------------
+const AttnTileSize = 256
+
 proc attentionDecodeKernel(
   qData, kCacheData, vCacheData, outData: ptr float32,
   nHead, nHeadKv, headDim, curLen, cacheCols: cint,
   invSqrtHeadDim: float32
 ) {.hippoGlobal.} =
+  ## Tiled online-softmax decode attention — no context length cap.
+  ## One block per head, 256 threads. Processes KV positions in tiles.
   let h = int(blockIdx.x)
   let tid = int(threadIdx.x)
   if h >= int(nHead):
@@ -2094,46 +2098,64 @@ proc attentionDecodeKernel(
   let group = int(nHead) div int(nHeadKv)
   let kvh = h div group
   let hOff = h * int(headDim)
-  var scores {.hippoShared.}: array[2048, float32]
+  let kvhOff = kvh * int(headDim)
+  var scores {.hippoShared.}: array[AttnTileSize, float32]
   var sMax {.hippoShared.}: array[HippoBlockSize, float32]
   var sSum {.hippoShared.}: array[HippoBlockSize, float32]
-  var localMax = -1e30'f32
-  var j = tid
-  while j < int(curLen):
-    var dot = 0.0'f32
-    for d in 0 ..< int(headDim):
-      let qIdx = hOff + d
-      let kIdx = (kvh * int(headDim) + d) * int(cacheCols) + j
-      dot = dot + q[qIdx] * kc[kIdx]
-    let score = dot * invSqrtHeadDim
-    scores[j] = score
-    if score > localMax:
-      localMax = score
-    j = j + int(blockDim.x)
-  sMax[tid] = localMax
-  hippoSyncthreads()
-  reduceMax256(sMax, tid)
-  let globalMax = sMax[0]
-  var localSum = 0.0'f32
-  j = tid
-  while j < int(curLen):
-    let e = expf(scores[j] - globalMax)
-    scores[j] = e
-    localSum = localSum + e
-    j = j + int(blockDim.x)
-  sSum[tid] = localSum
-  hippoSyncthreads()
-  reduceSum256(sSum, tid)
-  let invSum = 1.0'f32 / sSum[0]
-  var d = tid
-  while d < int(headDim):
-    var acc = 0.0'f32
-    for jj in 0 ..< int(curLen):
-      let vIdx = (kvh * int(headDim) + d) * int(cacheCols) + jj
-      acc = acc + scores[jj] * vc[vIdx]
-    let outIdx = hOff + d
-    o[outIdx] = acc * invSum
-    d = d + int(blockDim.x)
+  let numTiles = (int(curLen) + AttnTileSize - 1) div AttnTileSize
+  var globalMax = -1e30'f32
+  var globalSum = 0.0'f32
+  var outAcc = 0.0'f32
+  for tile in 0 ..< numTiles:
+    let tileStart = tile * AttnTileSize
+    let tileEnd = min(tileStart + AttnTileSize, int(curLen))
+    let tileLen = tileEnd - tileStart
+    var localMax = -1e30'f32
+    var j = tid
+    while j < tileLen:
+      var dot = 0.0'f32
+      for d in 0 ..< int(headDim):
+        dot = dot + q[hOff + d] * kc[(kvhOff + d) * int(cacheCols) + tileStart + j]
+      let score = dot * invSqrtHeadDim
+      scores[j] = score
+      if score > localMax:
+        localMax = score
+      j = j + int(blockDim.x)
+    sMax[tid] = localMax
+    hippoSyncthreads()
+    reduceMax256(sMax, tid)
+    let tileMax = sMax[0]
+    hippoSyncthreads()
+    var localSum = 0.0'f32
+    j = tid
+    while j < tileLen:
+      let e = expf(scores[j] - tileMax)
+      scores[j] = e
+      localSum = localSum + e
+      j = j + int(blockDim.x)
+    sSum[tid] = localSum
+    hippoSyncthreads()
+    reduceSum256(sSum, tid)
+    let tileSum = sSum[0]
+    hippoSyncthreads()
+    var scoresCorrection = 1.0'f32
+    var outCorrection = 1.0'f32
+    if tileMax > globalMax:
+      outCorrection = expf(globalMax - tileMax)
+      globalSum = globalSum * outCorrection + tileSum
+      globalMax = tileMax
+    else:
+      scoresCorrection = expf(tileMax - globalMax)
+      globalSum = globalSum + tileSum * scoresCorrection
+    if tid < int(headDim):
+      outAcc = outAcc * outCorrection
+      var acc = 0.0'f32
+      for jj in 0 ..< tileLen:
+        acc = acc + scores[jj] * vc[(kvhOff + tid) * int(cacheCols) + tileStart + jj]
+      outAcc = outAcc + acc * scoresCorrection
+    hippoSyncthreads()
+  if tid < int(headDim):
+    o[hOff + tid] = outAcc / globalSum
 
 proc gpuAttentionDecode*(dst: pointer, q, kCache, vCache: pointer,
                           nHead, nHeadKv, headDim, curLen, cacheCols: int,
