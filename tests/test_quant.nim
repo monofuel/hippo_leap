@@ -20,8 +20,12 @@ proc testRowSizeCalculations() =
   doAssert rowSizeQ2K(512) == 2 * BlockQ2KSize
   doAssert rowSizeQ3K(256) == BlockQ3KSize
   doAssert rowSizeQ3K(512) == 2 * BlockQ3KSize
+  doAssert rowSizeQ4K(256) == BlockQ4KSize
+  doAssert rowSizeQ4K(512) == 2 * BlockQ4KSize
   doAssert rowSizeQ6K(256) == BlockQ6KSize
   doAssert rowSizeQ6K(512) == 2 * BlockQ6KSize
+  doAssert rowSizeQ8_0(32) == BlockQ8_0Size
+  doAssert rowSizeQ8_0(64) == 2 * BlockQ8_0Size
   echo "[OK] Row size calculations"
 
 proc testRowSizeInvalidAlignment() =
@@ -42,18 +46,35 @@ proc testRowSizeInvalidAlignment() =
 
   caught = false
   try:
+    discard rowSizeQ4K(100)
+  except ValueError:
+    caught = true
+  doAssert caught, "expected ValueError for non-256-aligned Q4K row"
+
+  caught = false
+  try:
     discard rowSizeQ6K(100)
   except ValueError:
     caught = true
   doAssert caught, "expected ValueError for non-256-aligned Q6K row"
+
+  caught = false
+  try:
+    discard rowSizeQ8_0(100)
+  except ValueError:
+    caught = true
+  doAssert caught, "expected ValueError for non-32-aligned Q8_0 row"
   echo "[OK] Row size invalid alignment raises"
 
 proc testBlockSizeConstants() =
   ## Verify block size constants match expected values.
   doAssert QK_K == 256
+  doAssert QK8_0 == 32
   doAssert BlockQ2KSize == 84
   doAssert BlockQ3KSize == 110
+  doAssert BlockQ4KSize == 144
   doAssert BlockQ6KSize == 210
+  doAssert BlockQ8_0Size == 34
   echo "[OK] Block size constants"
 
 when isMainModule:

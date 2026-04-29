@@ -10,8 +10,10 @@ when cpuEndian != littleEndian:
 const
   GgmlTypeF32* = 0
   GgmlTypeF16* = 1
+  GgmlTypeQ8_0* = 8
   GgmlTypeQ2K* = 10
   GgmlTypeQ3K* = 11
+  GgmlTypeQ4K* = 12
   GgmlTypeQ6K* = 14
 
 type
@@ -63,6 +65,12 @@ proc loadTensorF32(g: GgufFile, info: GgufTensorInfo): Tensor =
       when cpuEndian != littleEndian:
         u = swapEndian(u)
       result.data[i] = halfToFloat(u)
+  of GgmlTypeQ8_0:
+    let rowSize = rowSizeQ8_0(rowLen)
+    for r in 0 ..< rows:
+      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
+      let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
+      dequantRowQ8_0(src, dst, rowLen)
   of GgmlTypeQ2K:
     let rowSize = rowSizeQ2K(rowLen)
     for r in 0 ..< rows:
@@ -75,6 +83,12 @@ proc loadTensorF32(g: GgufFile, info: GgufTensorInfo): Tensor =
       let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
       let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
       dequantRowQ3K(src, dst, rowLen)
+  of GgmlTypeQ4K:
+    let rowSize = rowSizeQ4K(rowLen)
+    for r in 0 ..< rows:
+      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
+      let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
+      dequantRowQ4K(src, dst, rowLen)
   of GgmlTypeQ6K:
     let rowSize = rowSizeQ6K(rowLen)
     for r in 0 ..< rows:

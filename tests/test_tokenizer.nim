@@ -63,8 +63,55 @@ proc testFormatChatPrompt() =
   echo "[OK] Chat prompt formatting"
   g.close()
 
+const
+  Llama3Path = "/mnt/steel-chest/LLM/lmstudio/models/lmstudio-community/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+
+proc testLlama3Vocab() =
+  if not fileExists(Llama3Path):
+    echo "[SKIP] Llama 3.2 model not found"
+    return
+  var g = openGguf(Llama3Path)
+  let vocab = loadVocab(g)
+  doAssert vocab.modelType == "gpt2", "expected gpt2, got " & vocab.modelType
+  doAssert vocab.tokens.len == 128256, "expected 128256 tokens, got " & $vocab.tokens.len
+  doAssert vocab.mergeRank.len > 0, "expected merges loaded"
+  doAssert vocab.bosId == 128000, "expected bosId 128000, got " & $vocab.bosId
+  doAssert vocab.stopTokenIds.len >= 2, "expected stop tokens"
+  echo "[OK] Llama 3.2 vocab: " & $vocab.tokens.len & " tokens, " & $vocab.mergeRank.len & " merges"
+  g.close()
+
+proc testLlama3Tokenize() =
+  if not fileExists(Llama3Path):
+    echo "[SKIP] Llama 3.2 model not found"
+    return
+  var g = openGguf(Llama3Path)
+  let vocab = loadVocab(g)
+  let tokens = vocab.tokenize("Hello world", addSpecial = false)
+  doAssert tokens.len > 0, "tokenize returned empty"
+  let decoded = vocab.detokenize(tokens)
+  doAssert "Hello" in decoded, "detokenize missing Hello, got: " & decoded
+  doAssert "world" in decoded, "detokenize missing world, got: " & decoded
+  echo "[OK] Llama 3.2 tokenize: " & $tokens.len & " tokens -> \"" & decoded & "\""
+  g.close()
+
+proc testLlama3ChatTemplate() =
+  if not fileExists(Llama3Path):
+    echo "[SKIP] Llama 3.2 model not found"
+    return
+  var g = openGguf(Llama3Path)
+  let vocab = loadVocab(g)
+  let formatted = vocab.formatChatPrompt("Hello")
+  doAssert formatted.contains("<|start_header_id|>"), "missing start_header_id"
+  doAssert formatted.contains("<|eot_id|>"), "missing eot_id"
+  doAssert formatted.contains("<|begin_of_text|>"), "missing begin_of_text"
+  echo "[OK] Llama 3.2 chat template"
+  g.close()
+
 when isMainModule:
   testLoadVocab()
   testTokenizeRoundtrip()
   testTokenizeWithBos()
   testFormatChatPrompt()
+  testLlama3Vocab()
+  testLlama3Tokenize()
+  testLlama3ChatTemplate()

@@ -1,7 +1,7 @@
 ## Minimal tokenizer for GGUF models (SPM/LLaMA style).
 
 import
-  std/[tables, heapqueue, strutils, sequtils],
+  std/[tables, heapqueue, strutils, sequtils, algorithm, unicode],
   ./gguf_loader
 
 const
@@ -29,6 +29,7 @@ type
   Vocab* = object
     tokens*: seq[TokenData]
     tokenToId*: Table[string, int]
+    mergeRank*: Table[string, int]
     addBos*: bool
     addEos*: bool
     addSpacePrefix*: bool
@@ -37,6 +38,7 @@ type
     unkId*: int32
     modelType*: string
     chatTemplate*: string
+    stopTokenIds*: seq[int32]
 
   Symbol = object
     prev, next: int
@@ -107,9 +109,18 @@ proc loadVocab*(g: GgufFile): Vocab =
   var bosId: int32 = 1
   var eosId: int32 = 2
   var unkId: int32 = 0
-  discard g.getKvI32(TokenBosIdKey, bosId)
-  discard g.getKvI32(TokenEosIdKey, eosId)
-  discard g.getKvI32(TokenUnkIdKey, unkId)
+  if not g.getKvI32(TokenBosIdKey, bosId):
+    var u: uint32
+    if g.getKvU32(TokenBosIdKey, u):
+      bosId = int32(u)
+  if not g.getKvI32(TokenEosIdKey, eosId):
+    var u: uint32
+    if g.getKvU32(TokenEosIdKey, u):
+      eosId = int32(u)
+  if not g.getKvI32(TokenUnkIdKey, unkId):
+    var u: uint32
+    if g.getKvU32(TokenUnkIdKey, u):
+      unkId = int32(u)
 
   result.modelType = modelType
   result.addBos = addBos
@@ -129,6 +140,25 @@ proc loadVocab*(g: GgufFile): Vocab =
   result.tokenToId = initTable[string, int](tokenList.len * 2)
   for i, tok in tokenList:
     result.tokenToId[tok] = i
+
+  if result.modelType == "gpt2":
+    var mergeStrs: seq[string]
+    if g.getKvArrStr("tokenizer.ggml.merges", mergeStrs):
+      result.mergeRank = initTable[string, int](mergeStrs.len * 2)
+      for i, m in mergeStrs:
+        result.mergeRank[m] = i
+
+    if result.bosId == 0 and result.tokenToId.hasKey("<|begin_of_text|>"):
+      result.bosId = int32(result.tokenToId["<|begin_of_text|>"])
+    if result.eosId == 0 and result.tokenToId.hasKey("<|end_of_text|>"):
+      result.eosId = int32(result.tokenToId["<|end_of_text|>"])
+
+  result.stopTokenIds = @[result.eosId]
+  for s in ["<|eot_id|>", "<|end_of_text|>", "</s>"]:
+    if result.tokenToId.hasKey(s):
+      let id = int32(result.tokenToId[s])
+      if id notin result.stopTokenIds:
+        result.stopTokenIds.add(id)
 
 proc tokenizeSpm(v: Vocab, text: string): seq[int32] =
   var raw = text
@@ -226,20 +256,91 @@ proc tokenizeSpm(v: Vocab, text: string): seq[int32] =
 
   outp
 
+proc buildByteToUnicode(): array[256, string] =
+  ## GPT-2 byte-to-unicode mapping.
+  var n = 0
+  for b in 0..255:
+    if (b >= 33 and b <= 126) or (b >= 161 and b <= 172) or (b >= 174 and b <= 255):
+      var s: string
+      let r = Rune(b)
+      s.add(r)
+      result[b] = s
+    else:
+      var s: string
+      let r = Rune(256 + n)
+      s.add(r)
+      result[b] = s
+      inc n
+
+let byteToUnicode = buildByteToUnicode()
+
+proc buildUnicodeToByte(): Table[Rune, byte] =
+  result = initTable[Rune, byte]()
+  for b in 0..255:
+    var r: Rune
+    fastRuneAt(byteToUnicode[b], 0, r, false)
+    result[r] = byte(b)
+
+let unicodeToByte = buildUnicodeToByte()
+
+proc tokenizeBpe(v: Vocab, text: string): seq[int32] =
+  ## Byte-level BPE tokenizer for GPT-2 style models (Llama 3, etc.).
+  if text.len == 0:
+    return @[]
+
+  var parts: seq[string]
+  for b in text:
+    parts.add(byteToUnicode[int(byte(b))])
+
+  while parts.len >= 2:
+    var bestRank = high(int)
+    var bestIdx = -1
+    for i in 0 ..< parts.len - 1:
+      let pair = parts[i] & " " & parts[i + 1]
+      if v.mergeRank.hasKey(pair):
+        let rank = v.mergeRank[pair]
+        if rank < bestRank:
+          bestRank = rank
+          bestIdx = i
+    if bestIdx < 0:
+      break
+    let merged = parts[bestIdx] & parts[bestIdx + 1]
+    parts.delete(bestIdx + 1)
+    parts[bestIdx] = merged
+
+  for p in parts:
+    if v.tokenToId.hasKey(p):
+      result.add(int32(v.tokenToId[p]))
+    else:
+      result.add(v.unkId)
+
 proc tokenize*(v: Vocab, text: string, addSpecial = true): seq[int32] =
-  ## Tokenize text using SentencePiece BPE, optionally adding BOS/EOS tokens.
-  result = tokenizeSpm(v, text)
+  ## Tokenize text, dispatching between SPM and BPE based on model type.
+  if v.modelType == "gpt2":
+    result = tokenizeBpe(v, text)
+  else:
+    result = tokenizeSpm(v, text)
   if addSpecial and v.addBos:
     result.insert(v.bosId, 0)
   if addSpecial and v.addEos:
     result.add(v.eosId)
 
+proc tokenizeRaw(v: Vocab, text: string): seq[int32] =
+  if v.modelType == "gpt2":
+    tokenizeBpe(v, text)
+  else:
+    tokenizeSpm(v, text)
+
 proc tokenizeWithSpecial*(v: Vocab, text: string, addSpecial = true): seq[int32] =
   ## Tokenize text while preserving special tokens as single token IDs.
-  var specials = @["<|user|>", "<|assistant|>", "<|system|>", "</s>", "<s>"]
+  var specials = @["<|user|>", "<|assistant|>", "<|system|>", "</s>", "<s>",
+                   "<|begin_of_text|>", "<|end_of_text|>", "<|start_header_id|>",
+                   "<|end_header_id|>", "<|eot_id|>"]
   specials = specials.filterIt(v.tokenToId.hasKey(it))
   if specials.len == 0:
     return tokenize(v, text, addSpecial)
+
+  specials.sort(proc(a, b: string): int = cmp(b.len, a.len))
 
   var pos = 0
   var outTokens: seq[int32] = @[]
@@ -248,14 +349,14 @@ proc tokenizeWithSpecial*(v: Vocab, text: string, addSpecial = true): seq[int32]
     var bestTok = ""
     for s in specials:
       let i = text.find(s, pos)
-      if i >= 0 and (bestIdx == -1 or i < bestIdx):
+      if i >= 0 and (bestIdx == -1 or i < bestIdx or (i == bestIdx and s.len > bestTok.len)):
         bestIdx = i
         bestTok = s
     if bestIdx == -1:
-      outTokens.add(tokenizeSpm(v, text.substr(pos)))
+      outTokens.add(tokenizeRaw(v, text.substr(pos)))
       break
     if bestIdx > pos:
-      outTokens.add(tokenizeSpm(v, text.substr(pos, bestIdx - 1)))
+      outTokens.add(tokenizeRaw(v, text.substr(pos, bestIdx - 1)))
     outTokens.add(int32(v.tokenToId[bestTok]))
     pos = bestIdx + bestTok.len
 
@@ -276,11 +377,12 @@ proc detokenize*(v: Vocab, tokens: seq[int32]): string =
   ## Convert a sequence of token IDs back to text.
   result = ""
   for t in tokens:
-    let piece = tokenToPiece(v, t)
-    if t == v.bosId or t == v.eosId:
+    if t in v.stopTokenIds or t == v.bosId:
       continue
-    if piece == "<s>" or piece == "</s>" or piece == "<|user|>" or
-       piece == "<|assistant|>" or piece == "<|system|>":
+    let piece = tokenToPiece(v, t)
+    if piece.startsWith("<|") and piece.endsWith("|>"):
+      continue
+    if piece == "<s>" or piece == "</s>":
       continue
     if piece.len == 6 and piece.startsWith("<0x") and piece.endsWith(">"):
       let hex = piece[3..4]
@@ -291,12 +393,24 @@ proc detokenize*(v: Vocab, tokens: seq[int32]): string =
         result.add(piece)
     else:
       result.add(piece)
-  result = result.replace("\xE2\x96\x81", " ")
+  if v.modelType == "gpt2":
+    var decoded = ""
+    for r in result.runes:
+      if unicodeToByte.hasKey(r):
+        decoded.add(char(unicodeToByte[r]))
+      else:
+        decoded.add(r)
+    result = decoded
+  else:
+    result = result.replace("\xE2\x96\x81", " ")
 
 proc formatChatPrompt*(v: Vocab, userText: string): string =
   ## Format user text using the model's chat template.
   if v.chatTemplate.len == 0:
     return userText
+  if v.chatTemplate.contains("<|start_header_id|>"):
+    return "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n" &
+           userText & "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
   if v.chatTemplate.contains("<|user|>") and v.chatTemplate.contains("<|assistant|>"):
     let eosPiece = tokenToPiece(v, v.eosId)
     return "<|user|>\n" & userText & eosPiece & "<|assistant|>"

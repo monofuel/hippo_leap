@@ -286,7 +286,9 @@ proc cachedQuantWeight*(name: string, m: var Model, tensorName: string): GpuQuan
   let rowSize = case info.elemType
     of GgmlTypeQ2K: rowSizeQ2K(nCols)
     of GgmlTypeQ3K: rowSizeQ3K(nCols)
+    of GgmlTypeQ4K: rowSizeQ4K(nCols)
     of GgmlTypeQ6K: rowSizeQ6K(nCols)
+    of GgmlTypeQ8_0: rowSizeQ8_0(nCols)
     else: raise newException(ValueError, "unsupported quant type for GPU upload: " & $info.elemType)
   let totalBytes = rowSize * nRows
   let alloc = hippoMalloc(totalBytes)
@@ -891,13 +893,141 @@ proc gpuLinearColQ6K*(dst, x, wQuant: pointer, wCols, wRows: int,
   else:
     {.error: "gpuLinearColQ6K requires WarpSize == 32".}
 
+# ---------------------------------------------------------------------------
+# Q8_0 GEMV decode (warp-per-row, WarpSize==32 only)
+# ---------------------------------------------------------------------------
+when HippoWarpSize == 32:
+  proc linearQ8_0WarpDecodeKernel(
+    wData: ptr uint8,
+    xData, outData: ptr float32,
+    outRows, wCols: cint
+  ) {.hippoGlobal.} =
+    let tid = cint(threadIdx.x)
+    let row = cint(blockIdx.x)
+    if row >= outRows:
+      return
+    let w = cast[ptr UncheckedArray[uint8]](wData)
+    let xArr = cast[ptr UncheckedArray[float32]](xData)
+    let outArr = cast[ptr UncheckedArray[float32]](outData)
+    let nBlocksPerRow = wCols div 32'i32
+    let rowSizeBytes = nBlocksPerRow * 34'i32
+    let rowBase = row * rowSizeBytes
+    var acc = 0.0'f32
+    var blkIdx = 0'i32
+    while blkIdx < nBlocksPerRow:
+      let bs = rowBase + blkIdx * 34'i32
+      let eb = blkIdx * 32'i32
+      let dRaw = uint16(w[bs]) or (uint16(w[bs + 1'i32]) shl 8)
+      let d = hippoHalfToFloat(dRaw)
+      let qVal = cast[int8](w[bs + 2'i32 + tid])
+      acc = acc + d * cfloat(qVal) * xArr[eb + tid]
+      blkIdx = blkIdx + 1'i32
+    acc = acc + hippoShflDown(acc, 16)
+    acc = acc + hippoShflDown(acc, 8)
+    acc = acc + hippoShflDown(acc, 4)
+    acc = acc + hippoShflDown(acc, 2)
+    acc = acc + hippoShflDown(acc, 1)
+    if tid == 0'i32:
+      outArr[row] = acc
+
+proc gpuLinearColQ8_0*(dst, x, wQuant: pointer, wCols, wRows: int,
+                        stream: HippoStream) =
+  when HippoWarpSize == 32:
+    let grid = newDim3(wRows.uint32)
+    let blk = newDim3(HippoWarpSize.uint32)
+    var wPtr = wQuant; var xPtr = x; var dPtr = dst
+    var outRowsArg = wRows.cint; var wColsArg = wCols.cint
+    hippoLaunchKernel(linearQ8_0WarpDecodeKernel, gridDim = grid, blockDim = blk,
+                      stream = stream,
+                      args = hippoArgs(wPtr, xPtr, dPtr, outRowsArg, wColsArg))
+  else:
+    {.error: "gpuLinearColQ8_0 requires WarpSize == 32".}
+
+# ---------------------------------------------------------------------------
+# Q4_K GEMV decode (warp-per-row, WarpSize==32 only)
+# ---------------------------------------------------------------------------
+when HippoWarpSize == 32:
+  proc getScaleMinK4Gpu(j: cint, sc: ptr UncheckedArray[uint8], dOut, mOut: var uint8) {.hippoDevice.} =
+    if j < 4'i32:
+      dOut = sc[j] and 63'u8
+      mOut = sc[j + 4'i32] and 63'u8
+    else:
+      dOut = (sc[j + 4'i32] and 0x0F'u8) or ((sc[j - 4'i32] shr 6'u8) shl 4'u8)
+      mOut = (sc[j + 4'i32] shr 4'u8) or ((sc[j] shr 6'u8) shl 4'u8)
+
+  proc linearQ4KWarpDecodeKernel(
+    wData: ptr uint8,
+    xData, outData: ptr float32,
+    outRows, wCols: cint
+  ) {.hippoGlobal.} =
+    ## Warp-per-row Q4_K GEMV. Each thread handles 8 elements per block.
+    let tid = cint(threadIdx.x)
+    let row = cint(blockIdx.x)
+    if row >= outRows:
+      return
+    let w = cast[ptr UncheckedArray[uint8]](wData)
+    let xArr = cast[ptr UncheckedArray[float32]](xData)
+    let outArr = cast[ptr UncheckedArray[float32]](outData)
+    let nBlocksPerRow = wCols div 256'i32
+    let rowSizeBytes = nBlocksPerRow * 144'i32
+    let rowBase = row * rowSizeBytes
+    var acc = 0.0'f32
+    var blkIdx = 0'i32
+    while blkIdx < nBlocksPerRow:
+      let bs = rowBase + blkIdx * 144'i32
+      let eb = blkIdx * 256'i32
+      let dRaw = uint16(w[bs]) or (uint16(w[bs + 1'i32]) shl 8)
+      let dmRaw = uint16(w[bs + 2'i32]) or (uint16(w[bs + 3'i32]) shl 8)
+      let dAll = hippoHalfToFloat(dRaw)
+      let dMin = hippoHalfToFloat(dmRaw)
+      let scales = cast[ptr UncheckedArray[uint8]](addr w[bs + 4'i32])
+      let qs = cast[ptr UncheckedArray[uint8]](addr w[bs + 16'i32])
+      var isIdx = 0'i32
+      var qOff = 0'i32
+      for grp in countup(0'i32, 3'i32):
+        var sc0, mn0, sc1, mn1: uint8
+        getScaleMinK4Gpu(isIdx, scales, sc0, mn0)
+        let d1 = dAll * cfloat(sc0)
+        let m1 = dMin * cfloat(mn0)
+        getScaleMinK4Gpu(isIdx + 1'i32, scales, sc1, mn1)
+        let d2 = dAll * cfloat(sc1)
+        let m2 = dMin * cfloat(mn1)
+        let qByte = qs[qOff + tid]
+        acc = acc + (d1 * cfloat(qByte and 0x0F'u8) - m1) * xArr[eb + grp * 64'i32 + tid]
+        acc = acc + (d2 * cfloat(qByte shr 4'u8) - m2) * xArr[eb + grp * 64'i32 + 32'i32 + tid]
+        isIdx = isIdx + 2'i32
+        qOff = qOff + 32'i32
+      blkIdx = blkIdx + 1'i32
+    acc = acc + hippoShflDown(acc, 16)
+    acc = acc + hippoShflDown(acc, 8)
+    acc = acc + hippoShflDown(acc, 4)
+    acc = acc + hippoShflDown(acc, 2)
+    acc = acc + hippoShflDown(acc, 1)
+    if tid == 0'i32:
+      outArr[row] = acc
+
+proc gpuLinearColQ4K*(dst, x, wQuant: pointer, wCols, wRows: int,
+                       stream: HippoStream) =
+  when HippoWarpSize == 32:
+    let grid = newDim3(wRows.uint32)
+    let blk = newDim3(HippoWarpSize.uint32)
+    var wPtr = wQuant; var xPtr = x; var dPtr = dst
+    var outRowsArg = wRows.cint; var wColsArg = wCols.cint
+    hippoLaunchKernel(linearQ4KWarpDecodeKernel, gridDim = grid, blockDim = blk,
+                      stream = stream,
+                      args = hippoArgs(wPtr, xPtr, dPtr, outRowsArg, wColsArg))
+  else:
+    {.error: "gpuLinearColQ4K requires WarpSize == 32".}
+
 proc gpuLinearColQuant*(dst, x, wQuant: pointer, wCols, wRows: int,
                          quantType: int32, stream: HippoStream) =
   ## Dispatch to the appropriate quantized GEMV kernel.
   case quantType
   of GgmlTypeQ2K: gpuLinearColQ2K(dst, x, wQuant, wCols, wRows, stream)
   of GgmlTypeQ3K: gpuLinearColQ3K(dst, x, wQuant, wCols, wRows, stream)
+  of GgmlTypeQ4K: gpuLinearColQ4K(dst, x, wQuant, wCols, wRows, stream)
   of GgmlTypeQ6K: gpuLinearColQ6K(dst, x, wQuant, wCols, wRows, stream)
+  of GgmlTypeQ8_0: gpuLinearColQ8_0(dst, x, wQuant, wCols, wRows, stream)
   else: raise newException(ValueError, "unsupported quant type for GPU GEMV: " & $quantType)
 
 # ---------------------------------------------------------------------------
@@ -1606,7 +1736,9 @@ proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
     template uploadWeight(fp32Field, quantField, qtypeField: untyped, tensorSuffix: string) =
       let tn = lp & tensorSuffix
       let et = m.infos[tn].elemType.int32
-      if et == GgmlTypeQ2K.int32 or et == GgmlTypeQ3K.int32:
+      if et == GgmlTypeQ2K.int32 or et == GgmlTypeQ3K.int32 or
+         et == GgmlTypeQ4K.int32 or et == GgmlTypeQ6K.int32 or
+         et == GgmlTypeQ8_0.int32:
         let qw = cachedQuantWeight(tn, m, tn)
         quantField = qw.devicePtr
         fp32Field = nil
@@ -1634,16 +1766,20 @@ proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
     norm = m.getTensor("norm.weight")
   modelPtrs.normWeight = cachedWeight("norm_or_output_norm.weight", norm).devicePtr
 
-  let outElemType = m.infos["output.weight"].elemType.int32
-  if outElemType == GgmlTypeQ6K:
-    let qw = cachedQuantWeight("output.weight", m, "output.weight")
+  let outTensorName = if m.infos.hasKey("output.weight"): "output.weight"
+                      else: "token_embd.weight"
+  let outElemType = m.infos[outTensorName].elemType.int32
+  if outElemType == GgmlTypeQ2K.int32 or outElemType == GgmlTypeQ3K.int32 or
+     outElemType == GgmlTypeQ4K.int32 or outElemType == GgmlTypeQ6K.int32 or
+     outElemType == GgmlTypeQ8_0.int32:
+    let qw = cachedQuantWeight("output.weight", m, outTensorName)
     modelPtrs.outputWeightQ = qw.devicePtr
     modelPtrs.outputWeight = nil
-    modelPtrs.outputQType = GgmlTypeQ6K
+    modelPtrs.outputQType = outElemType
     modelPtrs.outputShape0 = hp.nEmb
     modelPtrs.outputShape1 = hp.nVocab
   else:
-    let outW = m.getTensor("output.weight")
+    let outW = m.getTensor(outTensorName)
     let a0 = outW.shape[0]
     let a1 = outW.shape[1]
     if a0 == hp.nEmb and a1 == hp.nVocab:
@@ -1842,7 +1978,9 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
     gpuAdd(xPtr, xPtr, tmp0, hp.nEmb * seqLen, stream)
 
   let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
-  let outW = outputWeightForLinear(m.getTensor("output.weight"), hp.nEmb, hp.nVocab)
+  let outTName = if m.infos.hasKey("output.weight"): "output.weight"
+                 else: "token_embd.weight"
+  let outW = outputWeightForLinear(m.getTensor(outTName), hp.nEmb, hp.nVocab)
   let dNorm = cachedWeight("norm_or_output_norm.weight", norm)
   let dOutW = cachedWeight("output.weight", outW)
 

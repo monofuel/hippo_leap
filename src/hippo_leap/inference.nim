@@ -75,7 +75,7 @@ proc generate*(ctx: var InferenceContext, text: string, maxTokens: int): Generat
   generated.add(nextToken)
 
   for i in 1 ..< maxGen:
-    if nextToken == ctx.vocab.eosId:
+    if nextToken in ctx.vocab.stopTokenIds:
       break
     logits = forwardDecode(ctx.model, nextToken, ctx.cache)
     nextToken = argmaxLast(logits, hp.nVocab)

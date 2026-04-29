@@ -6,9 +6,12 @@ when cpuEndian != littleEndian:
 
 const
   QK_K* = 256
+  QK8_0* = 32
   BlockQ2KSize* = 2 + 2 + (QK_K div 16) + (QK_K div 4)
   BlockQ3KSize* = 2 + (QK_K div 4) + (QK_K div 8) + 12
+  BlockQ4KSize* = 2 + 2 + 12 + (QK_K div 2)   # d + dmin + scales + 4-bit quants
   BlockQ6KSize* = 2 + (QK_K div 16) + 3 * (QK_K div 4)
+  BlockQ8_0Size* = 2 + QK8_0                    # fp16 scale + int8 quants
 
 proc rowSizeQ2K*(rowLen: int): int =
   ## Compute byte size of a Q2_K quantized row.
@@ -22,11 +25,21 @@ proc rowSizeQ3K*(rowLen: int): int =
     raise newException(ValueError, "q3_K row size must be multiple of 256")
   (rowLen div QK_K) * BlockQ3KSize
 
+proc rowSizeQ4K*(rowLen: int): int =
+  if (rowLen mod QK_K) != 0:
+    raise newException(ValueError, "q4_K row size must be multiple of 256")
+  (rowLen div QK_K) * BlockQ4KSize
+
 proc rowSizeQ6K*(rowLen: int): int =
   ## Compute byte size of a Q6_K quantized row.
   if (rowLen mod QK_K) != 0:
     raise newException(ValueError, "q6_K row size must be multiple of 256")
   (rowLen div QK_K) * BlockQ6KSize
+
+proc rowSizeQ8_0*(rowLen: int): int =
+  if (rowLen mod QK8_0) != 0:
+    raise newException(ValueError, "q8_0 row size must be multiple of 32")
+  (rowLen div QK8_0) * BlockQ8_0Size
 
 proc halfToFloat*(h: uint16): float32 =
   ## Convert IEEE 754 half-precision to float32.
@@ -150,6 +163,67 @@ proc dequantRowQ3K*(src: ptr UncheckedArray[byte], dst: ptr UncheckedArray[float
         m = m shl 1
       qOffset += 32
     offset += BlockQ3KSize
+
+proc getScaleMinK4(j: int, scales: ptr UncheckedArray[uint8], sc, mn: var uint8) =
+  ## Unpack 6-bit scale and min from Q4_K packed scales array (12 bytes → 8 pairs).
+  if j < 4:
+    sc = scales[j] and 63
+    mn = scales[j + 4] and 63
+  else:
+    sc = (scales[j + 4] and 0x0F) or ((scales[j - 4] shr 6) shl 4)
+    mn = (scales[j + 4] shr 4) or ((scales[j] shr 6) shl 4)
+
+proc dequantRowQ4K*(src: ptr UncheckedArray[byte], dst: ptr UncheckedArray[float32], k: int) =
+  if (k mod QK_K) != 0:
+    raise newException(ValueError, "q4_K row size must be multiple of 256")
+  let nBlocks = k div QK_K
+  var outIdx = 0
+  var offset = 0
+  for _ in 0 ..< nBlocks:
+    var dRaw = cast[ptr UncheckedArray[uint16]](addr src[offset])[0]
+    var dminRaw = cast[ptr UncheckedArray[uint16]](addr src[offset + 2])[0]
+    when cpuEndian != littleEndian:
+      dRaw = swapEndian(dRaw)
+      dminRaw = swapEndian(dminRaw)
+    let d = halfToFloat(dRaw)
+    let dmin = halfToFloat(dminRaw)
+    let scales = cast[ptr UncheckedArray[uint8]](addr src[offset + 4])
+    let q = cast[ptr UncheckedArray[uint8]](addr src[offset + 16])
+    var isIdx = 0
+    var qOff = 0
+    for j in countup(0, QK_K - 1, 64):
+      var sc, mn: uint8
+      getScaleMinK4(isIdx, scales, sc, mn)
+      let d1 = d * float32(sc)
+      let m1 = dmin * float32(mn)
+      getScaleMinK4(isIdx + 1, scales, sc, mn)
+      let d2 = d * float32(sc)
+      let m2 = dmin * float32(mn)
+      for l in 0 ..< 32:
+        dst[outIdx + l] = d1 * float32(q[qOff + l] and 0x0F) - m1
+      for l in 0 ..< 32:
+        dst[outIdx + 32 + l] = d2 * float32(q[qOff + l] shr 4) - m2
+      outIdx += 64
+      qOff += 32
+      isIdx += 2
+    offset += BlockQ4KSize
+
+proc dequantRowQ8_0*(src: ptr UncheckedArray[byte], dst: ptr UncheckedArray[float32], k: int) =
+  if (k mod QK8_0) != 0:
+    raise newException(ValueError, "q8_0 row size must be multiple of 32")
+  let nBlocks = k div QK8_0
+  var outIdx = 0
+  var offset = 0
+  for _ in 0 ..< nBlocks:
+    var dRaw = cast[ptr UncheckedArray[uint16]](addr src[offset])[0]
+    when cpuEndian != littleEndian:
+      dRaw = swapEndian(dRaw)
+    let d = halfToFloat(dRaw)
+    let qs = cast[ptr UncheckedArray[int8]](addr src[offset + 2])
+    for j in 0 ..< QK8_0:
+      dst[outIdx + j] = float32(qs[j]) * d
+    outIdx += QK8_0
+    offset += BlockQ8_0Size
 
 proc dequantRowQ6K*(src: ptr UncheckedArray[byte], dst: ptr UncheckedArray[float32], k: int) =
   ## Dequantize a row of k elements in Q6_K format.
