@@ -44,6 +44,7 @@ type
     attnNorm*, ffnNorm*: pointer
     wq*, wk*, wv*, wo*: pointer
     wGate*, wUp*, wDown*: pointer
+    attnQNorm*, attnKNorm*: pointer
     wqQ*, wkQ*, wvQ*, woQ*: pointer
     wGateQ*, wUpQ*, wDownQ*: pointer
     wColsQ*, wColsDown*: int

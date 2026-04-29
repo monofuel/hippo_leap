@@ -26,6 +26,7 @@ type
     nFfn*: int
     nHead*: int
     nHeadKv*: int
+    headDim*: int
     ropeDim*: int
     ropeFreqBase*: float32
     rmsEps*: float32
@@ -100,18 +101,24 @@ proc loadTensorF32(g: GgufFile, info: GgufTensorInfo): Tensor =
 
 proc loadHParams(g: GgufFile): HParams =
   discard g.getKvStr("general.architecture", result.arch)
+  let prefix = if result.arch.len > 0: result.arch & "." else: "llama."
   var v: uint32
-  if g.getKvU32("llama.vocab_size", v): result.nVocab = int(v)
-  if g.getKvU32("llama.context_length", v): result.nCtx = int(v)
-  if g.getKvU32("llama.embedding_length", v): result.nEmb = int(v)
-  if g.getKvU32("llama.block_count", v): result.nLayer = int(v)
-  if g.getKvU32("llama.feed_forward_length", v): result.nFfn = int(v)
-  if g.getKvU32("llama.attention.head_count", v): result.nHead = int(v)
-  if g.getKvU32("llama.attention.head_count_kv", v): result.nHeadKv = int(v)
-  if g.getKvU32("llama.rope.dimension_count", v): result.ropeDim = int(v)
+  if g.getKvU32(prefix & "vocab_size", v): result.nVocab = int(v)
+  if g.getKvU32(prefix & "context_length", v): result.nCtx = int(v)
+  if g.getKvU32(prefix & "embedding_length", v): result.nEmb = int(v)
+  if g.getKvU32(prefix & "block_count", v): result.nLayer = int(v)
+  if g.getKvU32(prefix & "feed_forward_length", v): result.nFfn = int(v)
+  if g.getKvU32(prefix & "attention.head_count", v): result.nHead = int(v)
+  if g.getKvU32(prefix & "attention.head_count_kv", v): result.nHeadKv = int(v)
+  if g.getKvU32(prefix & "attention.key_length", v): result.headDim = int(v)
+  if g.getKvU32(prefix & "rope.dimension_count", v): result.ropeDim = int(v)
   var f: float32
-  if g.getKvF32("llama.rope.freq_base", f): result.ropeFreqBase = f
-  if g.getKvF32("llama.attention.layer_norm_rms_epsilon", f): result.rmsEps = f
+  if g.getKvF32(prefix & "rope.freq_base", f): result.ropeFreqBase = f
+  if g.getKvF32(prefix & "attention.layer_norm_rms_epsilon", f): result.rmsEps = f
+  if result.headDim == 0 and result.nHead > 0 and result.nEmb > 0:
+    result.headDim = result.nEmb div result.nHead
+  if result.ropeDim == 0:
+    result.ropeDim = result.headDim
   if result.nVocab == 0:
     var tokens: seq[string]
     if g.getKvArrStr("tokenizer.ggml.tokens", tokens):

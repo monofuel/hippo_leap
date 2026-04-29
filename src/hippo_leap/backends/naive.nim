@@ -1884,6 +1884,95 @@ proc gpuResidualRmsnorm*(normOut, x, residual, weight: pointer, dim: int,
                     args = hippoArgs(xPtr, resPtr, wPtr, dPtr, dimArg, epsArg))
 
 # ---------------------------------------------------------------------------
+# QK normalization (per-head RMSNorm for Qwen3-style models)
+# ---------------------------------------------------------------------------
+proc qkNormKernel(
+  xData, weightData: ptr float32,
+  nHead, headDim: cint, eps: float32
+) {.hippoGlobal.} =
+  var sdata {.hippoShared.}: array[HippoBlockSize, float32]
+  let h = int(blockIdx.x)
+  let tid = int(threadIdx.x)
+  if h >= int(nHead):
+    return
+  let x = cast[ptr UncheckedArray[float32]](xData)
+  let w = cast[ptr UncheckedArray[float32]](weightData)
+  let hOff = h * int(headDim)
+  var ss = 0.0'f32
+  var r = tid
+  while r < int(headDim):
+    let v = x[hOff + r]
+    ss = ss + v * v
+    r = r + int(blockDim.x)
+  sdata[tid] = ss
+  hippoSyncthreads()
+  reduceSum256(sdata, tid)
+  var inv {.hippoShared.}: array[1, float32]
+  if tid == 0:
+    inv[0] = 1.0'f32 / sqrtf(sdata[0] / cfloat(headDim) + cfloat(eps))
+  hippoSyncthreads()
+  let invVal = inv[0]
+  r = tid
+  while r < int(headDim):
+    x[hOff + r] = x[hOff + r] * invVal * w[r]
+    r = r + int(blockDim.x)
+
+proc gpuQkNorm*(x, weight: pointer, nHead, headDim: int,
+                eps: float32, stream: HippoStream) =
+  let grid = newDim3(nHead.uint32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var xPtr = x; var wPtr = weight
+  var nHeadArg = nHead.cint; var hdArg = headDim.cint; var epsArg = eps
+  hippoLaunchKernel(qkNormKernel, gridDim = grid, blockDim = blk,
+                    stream = stream,
+                    args = hippoArgs(xPtr, wPtr, nHeadArg, hdArg, epsArg))
+
+proc qkNormPrefillKernel(
+  xData, weightData: ptr float32,
+  nHead, headDim, seqLen: cint, eps: float32
+) {.hippoGlobal.} =
+  var sdata {.hippoShared.}: array[HippoBlockSize, float32]
+  let blockId = int(blockIdx.x)
+  let h = blockId div int(seqLen)
+  let col = blockId mod int(seqLen)
+  let tid = int(threadIdx.x)
+  if h >= int(nHead):
+    return
+  let x = cast[ptr UncheckedArray[float32]](xData)
+  let w = cast[ptr UncheckedArray[float32]](weightData)
+  let baseRow = h * int(headDim)
+  var ss = 0.0'f32
+  var r = tid
+  while r < int(headDim):
+    let v = x[(baseRow + r) * int(seqLen) + col]
+    ss = ss + v * v
+    r = r + int(blockDim.x)
+  sdata[tid] = ss
+  hippoSyncthreads()
+  reduceSum256(sdata, tid)
+  var inv {.hippoShared.}: array[1, float32]
+  if tid == 0:
+    inv[0] = 1.0'f32 / sqrtf(sdata[0] / cfloat(headDim) + cfloat(eps))
+  hippoSyncthreads()
+  let invVal = inv[0]
+  r = tid
+  while r < int(headDim):
+    let idx = (baseRow + r) * int(seqLen) + col
+    x[idx] = x[idx] * invVal * w[r]
+    r = r + int(blockDim.x)
+
+proc gpuQkNormPrefill*(x, weight: pointer, nHead, headDim, seqLen: int,
+                       eps: float32, stream: HippoStream) =
+  let grid = newDim3((nHead * seqLen).uint32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var xPtr = x; var wPtr = weight
+  var nHeadArg = nHead.cint; var hdArg = headDim.cint
+  var seqLenArg = seqLen.cint; var epsArg = eps
+  hippoLaunchKernel(qkNormPrefillKernel, gridDim = grid, blockDim = blk,
+                    stream = stream,
+                    args = hippoArgs(xPtr, wPtr, nHeadArg, hdArg, seqLenArg, epsArg))
+
+# ---------------------------------------------------------------------------
 # Embedding kernel
 # ---------------------------------------------------------------------------
 proc embeddingKernel(
@@ -2480,6 +2569,12 @@ proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
     uploadWeight(lw.wDown, lw.wDownQ, lw.wDownQType, "ffn_down.weight")
     lw.wColsQ = hp.nEmb
     lw.wColsDown = hp.nFfn
+    if m.infos.hasKey(lp & "attn_q_norm.weight"):
+      lw.attnQNorm = cachedWeight(lp & "attn_q_norm.weight",
+                                   m.getTensor(lp & "attn_q_norm.weight")).devicePtr
+    if m.infos.hasKey(lp & "attn_k_norm.weight"):
+      lw.attnKNorm = cachedWeight(lp & "attn_k_norm.weight",
+                                   m.getTensor(lp & "attn_k_norm.weight")).devicePtr
     modelPtrs.layers[layer] = lw
 
   var norm: Tensor
@@ -2587,7 +2682,7 @@ proc initKvCache*(hp: HParams, maxLen: int): KvCache =
   result.maxLen = maxLen
   result.curLen = 0
   result.nHeadKv = hp.nHeadKv
-  result.headDim = hp.nEmb div hp.nHead
+  result.headDim = hp.headDim
   let kvDim = hp.nHeadKv * result.headDim
   result.k = newSeq[Tensor](hp.nLayer)
   result.v = newSeq[Tensor](hp.nLayer)
@@ -2633,7 +2728,7 @@ proc unloadModelBackend*() =
 proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tensor =
   ## Run prefill forward pass on GPU for the given token sequence.
   let hp = m.hparams
-  if hp.arch != "" and hp.arch != "llama":
+  if hp.arch != "" and hp.arch notin ["llama", "qwen3"]:
     raise newException(ValueError, "unsupported architecture: " & hp.arch)
   if hp.nHeadKv != 0 and (hp.nHead mod hp.nHeadKv) != 0:
     raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
@@ -2642,13 +2737,14 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
   if tokens.len > cache.maxLen:
     raise newException(ValueError, "prefill exceeds KV cache capacity")
 
-  let headDim = hp.nEmb div hp.nHead
+  let headDim = hp.headDim
   let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
+  let qDim = hp.nHead * headDim
   let kvDim = hp.nHeadKv * headDim
   let seqLen = tokens.len
 
   ensureGpuContext()
-  let maxRows = max(max(hp.nEmb, hp.nFfn), hp.nVocab)
+  let maxRows = max(max(max(hp.nEmb, hp.nFfn), hp.nVocab), qDim)
   ensureActivationBuffers(maxRows * seqLen)
   ensureScratchBuffers(maxRows * seqLen)
   let stream = gpuCtx.stream
@@ -2679,9 +2775,15 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
     let dWDown = cachedWeight(lp & "ffn_down.weight", m.getTensor(lp & "ffn_down.weight"))
 
     gpuRmsnormCols(xNormPtr, xPtr, dAttnNorm.devicePtr, hp.nEmb, seqLen, hp.rmsEps, stream)
-    gpuLinearCol(tmp0, xNormPtr, dWq.devicePtr, hp.nEmb, hp.nEmb, seqLen, stream)
+    gpuLinearCol(tmp0, xNormPtr, dWq.devicePtr, hp.nEmb, qDim, seqLen, stream)
     gpuLinearCol(tmp1, xNormPtr, dWk.devicePtr, hp.nEmb, kvDim, seqLen, stream)
     gpuLinearCol(tmp2, xNormPtr, dWv.devicePtr, hp.nEmb, kvDim, seqLen, stream)
+    if m.infos.hasKey(lp & "attn_q_norm.weight"):
+      let dQNorm = cachedWeight(lp & "attn_q_norm.weight", m.getTensor(lp & "attn_q_norm.weight"))
+      gpuQkNormPrefill(tmp0, dQNorm.devicePtr, hp.nHead, headDim, seqLen, hp.rmsEps, stream)
+    if m.infos.hasKey(lp & "attn_k_norm.weight"):
+      let dKNorm = cachedWeight(lp & "attn_k_norm.weight", m.getTensor(lp & "attn_k_norm.weight"))
+      gpuQkNormPrefill(tmp1, dKNorm.devicePtr, hp.nHeadKv, headDim, seqLen, hp.rmsEps, stream)
     gpuRopeAtPos(tmp0, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, 0, seqLen, stream)
     gpuRopeAtPos(tmp1, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, 0, seqLen, stream)
 
@@ -2690,7 +2792,7 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
 
     gpuAttentionPrefill(xNormPtr, tmp0, tmp1, tmp2,
                         hp.nHead, hp.nHeadKv, headDim, seqLen, stream)
-    gpuLinearCol(tmp0, xNormPtr, dWo.devicePtr, hp.nEmb, hp.nEmb, seqLen, stream)
+    gpuLinearCol(tmp0, xNormPtr, dWo.devicePtr, qDim, hp.nEmb, seqLen, stream)
     gpuAdd(xPtr, xPtr, tmp0, hp.nEmb * seqLen, stream)
 
     gpuRmsnormCols(xNormPtr, xPtr, dFfnNorm.devicePtr, hp.nEmb, seqLen, hp.rmsEps, stream)
@@ -2724,20 +2826,21 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
 proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
   ## Run single-token decode forward pass on GPU.
   let hp = m.hparams
-  if hp.arch != "" and hp.arch != "llama":
+  if hp.arch != "" and hp.arch notin ["llama", "qwen3"]:
     raise newException(ValueError, "unsupported architecture: " & hp.arch)
   if hp.nHeadKv != 0 and (hp.nHead mod hp.nHeadKv) != 0:
     raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
   if cache.curLen >= cache.maxLen:
     raise newException(ValueError, "KV cache full")
 
-  let headDim = hp.nEmb div hp.nHead
+  let headDim = hp.headDim
   let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
+  let qDim = hp.nHead * headDim
   let kvDim = hp.nHeadKv * headDim
   let pos = cache.curLen
 
   ensureGpuContext()
-  let maxRows = max(max(hp.nEmb, hp.nFfn), hp.nVocab)
+  let maxRows = max(max(max(hp.nEmb, hp.nFfn), hp.nVocab), qDim)
   ensureActivationBuffers(maxRows)
   ensureScratchBuffers(maxRows)
   let stream = gpuCtx.stream
@@ -2786,9 +2889,9 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
       let klStart = epochTime()
       recordStart(eventPairs, KcLinearQkv, stream)
     if lw.wqQ != nil:
-      gpuLinearColQuant(tmp0, xNormPtr, lw.wqQ, hp.nEmb, hp.nEmb, lw.wqQType, stream)
+      gpuLinearColQuant(tmp0, xNormPtr, lw.wqQ, hp.nEmb, qDim, lw.wqQType, stream)
     else:
-      gpuLinearCol(tmp0, xNormPtr, lw.wq, hp.nEmb, hp.nEmb, 1, stream)
+      gpuLinearCol(tmp0, xNormPtr, lw.wq, hp.nEmb, qDim, 1, stream)
     when HippoWarpSize == 32:
       if lw.wkQ != nil and lw.wvQ != nil and lw.wkQType == GgmlTypeQ4K and lw.wvQType == GgmlTypeQ4K:
         gpuFusedKVLinearQ4K(tmp1, tmp2, xNormPtr, lw.wkQ, lw.wvQ, hp.nEmb, kvDim, stream)
@@ -2812,6 +2915,10 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
         gpuLinearColQuant(tmp2, xNormPtr, lw.wvQ, hp.nEmb, kvDim, lw.wvQType, stream)
       else:
         gpuLinearCol(tmp2, xNormPtr, lw.wv, hp.nEmb, kvDim, 1, stream)
+    if lw.attnQNorm != nil:
+      gpuQkNorm(tmp0, lw.attnQNorm, hp.nHead, headDim, hp.rmsEps, stream)
+    if lw.attnKNorm != nil:
+      gpuQkNorm(tmp1, lw.attnKNorm, hp.nHeadKv, headDim, hp.rmsEps, stream)
     when defined(profileHippo):
       recordStop(eventPairs, stream)
       recordStart(eventPairs, KcRope, stream)
@@ -2833,9 +2940,9 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
       recordStop(eventPairs, stream)
       recordStart(eventPairs, KcLinearO, stream)
     if lw.woQ != nil:
-      gpuLinearColQuant(tmp0, xNormPtr, lw.woQ, hp.nEmb, hp.nEmb, lw.woQType, stream)
+      gpuLinearColQuant(tmp0, xNormPtr, lw.woQ, qDim, hp.nEmb, lw.woQType, stream)
     else:
-      gpuLinearCol(tmp0, xNormPtr, lw.wo, hp.nEmb, hp.nEmb, 1, stream)
+      gpuLinearCol(tmp0, xNormPtr, lw.wo, qDim, hp.nEmb, 1, stream)
     when defined(profileHippo):
       recordStop(eventPairs, stream)
       recordStart(eventPairs, KcResidualAttn, stream)
@@ -2939,20 +3046,21 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
 proc forwardDecodeToken*(m: var Model, token: int32, cache: var KvCache): int32 =
   ## Run single-token decode and return argmax token ID without downloading logits.
   let hp = m.hparams
-  if hp.arch != "" and hp.arch != "llama":
+  if hp.arch != "" and hp.arch notin ["llama", "qwen3"]:
     raise newException(ValueError, "unsupported architecture: " & hp.arch)
   if hp.nHeadKv != 0 and (hp.nHead mod hp.nHeadKv) != 0:
     raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
   if cache.curLen >= cache.maxLen:
     raise newException(ValueError, "KV cache full")
 
-  let headDim = hp.nEmb div hp.nHead
+  let headDim = hp.headDim
   let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
+  let qDim = hp.nHead * headDim
   let kvDim = hp.nHeadKv * headDim
   let pos = cache.curLen
 
   ensureGpuContext()
-  let maxRows = max(max(hp.nEmb, hp.nFfn), hp.nVocab)
+  let maxRows = max(max(max(hp.nEmb, hp.nFfn), hp.nVocab), qDim)
   ensureActivationBuffers(maxRows)
   ensureScratchBuffers(maxRows)
   let stream = gpuCtx.stream
@@ -2977,9 +3085,9 @@ proc forwardDecodeToken*(m: var Model, token: int32, cache: var KvCache): int32 
     let lw = modelPtrs.layers[layer]
 
     if lw.wqQ != nil:
-      gpuLinearColQuant(tmp0, xNormPtr, lw.wqQ, hp.nEmb, hp.nEmb, lw.wqQType, stream)
+      gpuLinearColQuant(tmp0, xNormPtr, lw.wqQ, hp.nEmb, qDim, lw.wqQType, stream)
     else:
-      gpuLinearCol(tmp0, xNormPtr, lw.wq, hp.nEmb, hp.nEmb, 1, stream)
+      gpuLinearCol(tmp0, xNormPtr, lw.wq, hp.nEmb, qDim, 1, stream)
     when HippoWarpSize == 32:
       if lw.wkQ != nil and lw.wvQ != nil and lw.wkQType == GgmlTypeQ4K and lw.wvQType == GgmlTypeQ4K:
         gpuFusedKVLinearQ4K(tmp1, tmp2, xNormPtr, lw.wkQ, lw.wvQ, hp.nEmb, kvDim, stream)
@@ -3003,6 +3111,10 @@ proc forwardDecodeToken*(m: var Model, token: int32, cache: var KvCache): int32 
         gpuLinearColQuant(tmp2, xNormPtr, lw.wvQ, hp.nEmb, kvDim, lw.wvQType, stream)
       else:
         gpuLinearCol(tmp2, xNormPtr, lw.wv, hp.nEmb, kvDim, 1, stream)
+    if lw.attnQNorm != nil:
+      gpuQkNorm(tmp0, lw.attnQNorm, hp.nHead, headDim, hp.rmsEps, stream)
+    if lw.attnKNorm != nil:
+      gpuQkNorm(tmp1, lw.attnKNorm, hp.nHeadKv, headDim, hp.rmsEps, stream)
     gpuFusedRopeStoreKV(tmp0, tmp1, tmp2,
                         cache.gpuCache.k[layer].devicePtr,
                         cache.gpuCache.v[layer].devicePtr,
@@ -3013,9 +3125,9 @@ proc forwardDecodeToken*(m: var Model, token: int32, cache: var KvCache): int32 
                        hp.nHead, hp.nHeadKv, headDim, pos + 1,
                        cache.gpuCache.maxLen, stream)
     if lw.woQ != nil:
-      gpuLinearColQuant(tmp0, xNormPtr, lw.woQ, hp.nEmb, hp.nEmb, lw.woQType, stream)
+      gpuLinearColQuant(tmp0, xNormPtr, lw.woQ, qDim, hp.nEmb, lw.woQType, stream)
     else:
-      gpuLinearCol(tmp0, xNormPtr, lw.wo, hp.nEmb, hp.nEmb, 1, stream)
+      gpuLinearCol(tmp0, xNormPtr, lw.wo, qDim, hp.nEmb, 1, stream)
     gpuResidualRmsnorm(xNormPtr, xPtr, tmp0, lw.ffnNorm, hp.nEmb, hp.rmsEps, stream)
     when HippoWarpSize == 32:
       if lw.wGateQType == GgmlTypeQ4K and lw.wUpQType == GgmlTypeQ4K:

@@ -154,7 +154,7 @@ proc loadVocab*(g: GgufFile): Vocab =
       result.eosId = int32(result.tokenToId["<|end_of_text|>"])
 
   result.stopTokenIds = @[result.eosId]
-  for s in ["<|eot_id|>", "<|end_of_text|>", "</s>"]:
+  for s in ["<|eot_id|>", "<|end_of_text|>", "</s>", "<|im_end|>"]:
     if result.tokenToId.hasKey(s):
       let id = int32(result.tokenToId[s])
       if id notin result.stopTokenIds:
@@ -335,7 +335,8 @@ proc tokenizeWithSpecial*(v: Vocab, text: string, addSpecial = true): seq[int32]
   ## Tokenize text while preserving special tokens as single token IDs.
   var specials = @["<|user|>", "<|assistant|>", "<|system|>", "</s>", "<s>",
                    "<|begin_of_text|>", "<|end_of_text|>", "<|start_header_id|>",
-                   "<|end_header_id|>", "<|eot_id|>"]
+                   "<|end_header_id|>", "<|eot_id|>",
+                   "<|im_start|>", "<|im_end|>"]
   specials = specials.filterIt(v.tokenToId.hasKey(it))
   if specials.len == 0:
     return tokenize(v, text, addSpecial)
@@ -411,6 +412,8 @@ proc formatChatPrompt*(v: Vocab, userText: string): string =
   if v.chatTemplate.contains("<|start_header_id|>"):
     return "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n" &
            userText & "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+  if v.chatTemplate.contains("<|im_start|>"):
+    return "<|im_start|>user\n" & userText & "<|im_end|>\n<|im_start|>assistant\n"
   if v.chatTemplate.contains("<|user|>") and v.chatTemplate.contains("<|assistant|>"):
     let eosPiece = tokenToPiece(v, v.eosId)
     return "<|user|>\n" & userText & eosPiece & "<|assistant|>"
