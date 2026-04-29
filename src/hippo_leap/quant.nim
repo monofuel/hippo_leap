@@ -41,6 +41,9 @@ proc rowSizeQ8_0*(rowLen: int): int =
     raise newException(ValueError, "q8_0 row size must be multiple of 32")
   (rowLen div QK8_0) * BlockQ8_0Size
 
+proc rowSizeF16*(rowLen: int): int =
+  rowLen * 2
+
 proc halfToFloat*(h: uint16): float32 =
   ## Convert IEEE 754 half-precision to float32.
   let s = (h shr 15) and 0x1

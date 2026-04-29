@@ -284,6 +284,7 @@ proc cachedQuantWeight*(name: string, m: var Model, tensorName: string): GpuQuan
   let nCols = int(info.ne[0])
   let nRows = tensorElemCount(info) div nCols
   let rowSize = case info.elemType
+    of GgmlTypeF16: rowSizeF16(nCols)
     of GgmlTypeQ2K: rowSizeQ2K(nCols)
     of GgmlTypeQ3K: rowSizeQ3K(nCols)
     of GgmlTypeQ4K: rowSizeQ4K(nCols)
@@ -296,6 +297,40 @@ proc cachedQuantWeight*(name: string, m: var Model, tensorName: string): GpuQuan
   result = GpuQuantWeight(devicePtr: alloc.p, alloc: alloc, sizeBytes: totalBytes,
                           nRows: nRows, nCols: nCols)
   quantWeightCache[name] = result
+
+proc dequantF16ToF32Kernel(
+  src: ptr uint16, dst: ptr float32, n: cint
+) {.hippoGlobal.} =
+  let idx = cint(blockIdx.x) * cint(blockDim.x) + cint(threadIdx.x)
+  if idx < n:
+    let s = cast[ptr UncheckedArray[uint16]](src)
+    let d = cast[ptr UncheckedArray[float32]](dst)
+    d[idx] = hippoHalfToFloat(s[idx])
+
+proc cachedF16WeightAsF32*(name: string, m: var Model, tensorName: string): GpuTensor =
+  if weightCache.hasKey(name):
+    return weightCache[name]
+  ensureGpuContext()
+  let info = m.infos[tensorName]
+  let nElems = tensorElemCount(info)
+  let dataPtr = tensorDataPtr(m.gguf, info)
+  let srcAlloc = hippoMalloc(nElems * 2)
+  hippoMemcpyAsync(srcAlloc.p, dataPtr, nElems * 2,
+                    HippoMemcpyHostToDevice, gpuCtx.stream)
+  let dstAlloc = hippoMalloc(nElems * sizeof(float32))
+  let blk = 256'u32
+  let grid = ((nElems.uint32 + blk - 1) div blk)
+  var srcPtr = srcAlloc.p; var dstPtr = dstAlloc.p; var nArg = nElems.cint
+  hippoLaunchKernel(dequantF16ToF32Kernel, gridDim = newDim3(grid),
+                    blockDim = newDim3(blk), stream = gpuCtx.stream,
+                    args = hippoArgs(srcPtr, dstPtr, nArg))
+  gpuStreamSync(gpuCtx.stream)
+  var shape = newSeq[int](int(info.nDims))
+  for i in 0 ..< int(info.nDims):
+    shape[i] = int(info.ne[i])
+  result = GpuTensor(devicePtr: dstAlloc.p, alloc: dstAlloc, shape: shape,
+                     sizeBytes: nElems * sizeof(float32))
+  weightCache[name] = result
 
 # ---------------------------------------------------------------------------
 # Kernel: Q2_K GEMV decode
@@ -1021,6 +1056,49 @@ proc gpuLinearColQ8_0*(dst, x, wQuant: pointer, wCols, wRows: int,
     {.error: "gpuLinearColQ8_0 requires WarpSize == 32".}
 
 # ---------------------------------------------------------------------------
+# F16 GEMV decode (warp-per-row, WarpSize==32 only)
+# ---------------------------------------------------------------------------
+when HippoWarpSize == 32:
+  proc linearF16WarpDecodeKernel(
+    wData: ptr uint16,
+    xData, outData: ptr float32,
+    outRows, wCols: cint
+  ) {.hippoGlobal.} =
+    let tid = cint(threadIdx.x)
+    let row = cint(blockIdx.x)
+    if row >= outRows:
+      return
+    let w = cast[ptr UncheckedArray[uint16]](wData)
+    let xArr = cast[ptr UncheckedArray[float32]](xData)
+    let outArr = cast[ptr UncheckedArray[float32]](outData)
+    let rowBase = row * wCols
+    var acc = 0.0'f32
+    var col = tid
+    while col < wCols:
+      acc = acc + hippoHalfToFloat(w[rowBase + col]) * xArr[col]
+      col = col + 32'i32
+    acc = acc + hippoShflDown(acc, 16)
+    acc = acc + hippoShflDown(acc, 8)
+    acc = acc + hippoShflDown(acc, 4)
+    acc = acc + hippoShflDown(acc, 2)
+    acc = acc + hippoShflDown(acc, 1)
+    if tid == 0'i32:
+      outArr[row] = acc
+
+proc gpuLinearColF16*(dst, x, wQuant: pointer, wCols, wRows: int,
+                      stream: HippoStream) =
+  when HippoWarpSize == 32:
+    let grid = newDim3(wRows.uint32)
+    let blk = newDim3(HippoWarpSize.uint32)
+    var wPtr = wQuant; var xPtr = x; var dPtr = dst
+    var outRowsArg = wRows.cint; var wColsArg = wCols.cint
+    hippoLaunchKernel(linearF16WarpDecodeKernel, gridDim = grid, blockDim = blk,
+                      stream = stream,
+                      args = hippoArgs(wPtr, xPtr, dPtr, outRowsArg, wColsArg))
+  else:
+    {.error: "gpuLinearColF16 requires WarpSize == 32".}
+
+# ---------------------------------------------------------------------------
 # Q4_K GEMV decode (warp-per-row, WarpSize==32 only)
 # ---------------------------------------------------------------------------
 when HippoWarpSize == 32:
@@ -1223,6 +1301,7 @@ proc gpuLinearColQuant*(dst, x, wQuant: pointer, wCols, wRows: int,
                          quantType: int32, stream: HippoStream) =
   ## Dispatch to the appropriate quantized GEMV kernel.
   case quantType
+  of GgmlTypeF16: gpuLinearColF16(dst, x, wQuant, wCols, wRows, stream)
   of GgmlTypeQ2K: gpuLinearColQ2K(dst, x, wQuant, wCols, wRows, stream)
   of GgmlTypeQ3K: gpuLinearColQ3K(dst, x, wQuant, wCols, wRows, stream)
   of GgmlTypeQ4K: gpuLinearColQ4K(dst, x, wQuant, wCols, wRows, stream)
@@ -2531,24 +2610,28 @@ proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
     return
   ensureGpuContext()
 
-  var tokEmb: Tensor
-  try:
-    tokEmb = m.getTensor("token_embd.weight")
-  except KeyError:
-    tokEmb = m.getTensor("tok_embeddings.weight")
-  modelPtrs.tokEmb = cachedWeight("token_embd_or_tok_embeddings", tokEmb).devicePtr
+  template loadF32Ptr(name: string): pointer =
+    if m.infos[name].elemType == GgmlTypeF16:
+      cachedF16WeightAsF32(name, m, name).devicePtr
+    else:
+      cachedWeight(name, m.getTensor(name)).devicePtr
+
+  let tokEmbName = if m.infos.hasKey("token_embd.weight"): "token_embd.weight"
+                   else: "tok_embeddings.weight"
+  modelPtrs.tokEmb = loadF32Ptr(tokEmbName)
 
   modelPtrs.layers = newSeq[LayerGpuPtrs](hp.nLayer)
   for layer in 0 ..< hp.nLayer:
     let lp = "blk." & $layer & "."
     var lw: LayerGpuPtrs
-    lw.attnNorm = cachedWeight(lp & "attn_norm.weight", m.getTensor(lp & "attn_norm.weight")).devicePtr
-    lw.ffnNorm = cachedWeight(lp & "ffn_norm.weight", m.getTensor(lp & "ffn_norm.weight")).devicePtr
+    lw.attnNorm = loadF32Ptr(lp & "attn_norm.weight")
+    lw.ffnNorm = loadF32Ptr(lp & "ffn_norm.weight")
 
     template uploadWeight(fp32Field, quantField, qtypeField: untyped, tensorSuffix: string) =
       let tn = lp & tensorSuffix
       let et = m.infos[tn].elemType.int32
-      if et == GgmlTypeQ2K.int32 or et == GgmlTypeQ3K.int32 or
+      if et == GgmlTypeF16.int32 or
+         et == GgmlTypeQ2K.int32 or et == GgmlTypeQ3K.int32 or
          et == GgmlTypeQ4K.int32 or et == GgmlTypeQ6K.int32 or
          et == GgmlTypeQ8_0.int32:
         let qw = cachedQuantWeight(tn, m, tn)
@@ -2570,24 +2653,20 @@ proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
     lw.wColsQ = hp.nEmb
     lw.wColsDown = hp.nFfn
     if m.infos.hasKey(lp & "attn_q_norm.weight"):
-      lw.attnQNorm = cachedWeight(lp & "attn_q_norm.weight",
-                                   m.getTensor(lp & "attn_q_norm.weight")).devicePtr
+      lw.attnQNorm = loadF32Ptr(lp & "attn_q_norm.weight")
     if m.infos.hasKey(lp & "attn_k_norm.weight"):
-      lw.attnKNorm = cachedWeight(lp & "attn_k_norm.weight",
-                                   m.getTensor(lp & "attn_k_norm.weight")).devicePtr
+      lw.attnKNorm = loadF32Ptr(lp & "attn_k_norm.weight")
     modelPtrs.layers[layer] = lw
 
-  var norm: Tensor
-  try:
-    norm = m.getTensor("output_norm.weight")
-  except KeyError:
-    norm = m.getTensor("norm.weight")
-  modelPtrs.normWeight = cachedWeight("norm_or_output_norm.weight", norm).devicePtr
+  let normName = if m.infos.hasKey("output_norm.weight"): "output_norm.weight"
+                 else: "norm.weight"
+  modelPtrs.normWeight = loadF32Ptr(normName)
 
   let outTensorName = if m.infos.hasKey("output.weight"): "output.weight"
                       else: "token_embd.weight"
   let outElemType = m.infos[outTensorName].elemType.int32
-  if outElemType == GgmlTypeQ2K.int32 or outElemType == GgmlTypeQ3K.int32 or
+  if outElemType == GgmlTypeF16.int32 or
+     outElemType == GgmlTypeQ2K.int32 or outElemType == GgmlTypeQ3K.int32 or
      outElemType == GgmlTypeQ4K.int32 or outElemType == GgmlTypeQ6K.int32 or
      outElemType == GgmlTypeQ8_0.int32:
     let qw = cachedQuantWeight("output.weight", m, outTensorName)
@@ -2762,27 +2841,33 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
   gpuEmbedding(xPtr, dTokEmb.devicePtr, cast[ptr int32](tokenPtr),
                hp.nEmb, seqLen, hp.nVocab, stream)
 
+  template loadF32Weight(name: string): GpuTensor =
+    if m.infos[name].elemType == GgmlTypeF16:
+      cachedF16WeightAsF32(name, m, name)
+    else:
+      cachedWeight(name, m.getTensor(name))
+
   for layer in 0 ..< hp.nLayer:
     let lp = "blk." & $layer & "."
-    let dAttnNorm = cachedWeight(lp & "attn_norm.weight", m.getTensor(lp & "attn_norm.weight"))
-    let dFfnNorm = cachedWeight(lp & "ffn_norm.weight", m.getTensor(lp & "ffn_norm.weight"))
-    let dWq = cachedWeight(lp & "attn_q.weight", m.getTensor(lp & "attn_q.weight"))
-    let dWk = cachedWeight(lp & "attn_k.weight", m.getTensor(lp & "attn_k.weight"))
-    let dWv = cachedWeight(lp & "attn_v.weight", m.getTensor(lp & "attn_v.weight"))
-    let dWo = cachedWeight(lp & "attn_output.weight", m.getTensor(lp & "attn_output.weight"))
-    let dWGate = cachedWeight(lp & "ffn_gate.weight", m.getTensor(lp & "ffn_gate.weight"))
-    let dWUp = cachedWeight(lp & "ffn_up.weight", m.getTensor(lp & "ffn_up.weight"))
-    let dWDown = cachedWeight(lp & "ffn_down.weight", m.getTensor(lp & "ffn_down.weight"))
+    let dAttnNorm = loadF32Weight(lp & "attn_norm.weight")
+    let dFfnNorm = loadF32Weight(lp & "ffn_norm.weight")
+    let dWq = loadF32Weight(lp & "attn_q.weight")
+    let dWk = loadF32Weight(lp & "attn_k.weight")
+    let dWv = loadF32Weight(lp & "attn_v.weight")
+    let dWo = loadF32Weight(lp & "attn_output.weight")
+    let dWGate = loadF32Weight(lp & "ffn_gate.weight")
+    let dWUp = loadF32Weight(lp & "ffn_up.weight")
+    let dWDown = loadF32Weight(lp & "ffn_down.weight")
 
     gpuRmsnormCols(xNormPtr, xPtr, dAttnNorm.devicePtr, hp.nEmb, seqLen, hp.rmsEps, stream)
     gpuLinearCol(tmp0, xNormPtr, dWq.devicePtr, hp.nEmb, qDim, seqLen, stream)
     gpuLinearCol(tmp1, xNormPtr, dWk.devicePtr, hp.nEmb, kvDim, seqLen, stream)
     gpuLinearCol(tmp2, xNormPtr, dWv.devicePtr, hp.nEmb, kvDim, seqLen, stream)
     if m.infos.hasKey(lp & "attn_q_norm.weight"):
-      let dQNorm = cachedWeight(lp & "attn_q_norm.weight", m.getTensor(lp & "attn_q_norm.weight"))
+      let dQNorm = loadF32Weight(lp & "attn_q_norm.weight")
       gpuQkNormPrefill(tmp0, dQNorm.devicePtr, hp.nHead, headDim, seqLen, hp.rmsEps, stream)
     if m.infos.hasKey(lp & "attn_k_norm.weight"):
-      let dKNorm = cachedWeight(lp & "attn_k_norm.weight", m.getTensor(lp & "attn_k_norm.weight"))
+      let dKNorm = loadF32Weight(lp & "attn_k_norm.weight")
       gpuQkNormPrefill(tmp1, dKNorm.devicePtr, hp.nHeadKv, headDim, seqLen, hp.rmsEps, stream)
     gpuRopeAtPos(tmp0, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, 0, seqLen, stream)
     gpuRopeAtPos(tmp1, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, 0, seqLen, stream)
@@ -2805,12 +2890,16 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
   let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
   let outTName = if m.infos.hasKey("output.weight"): "output.weight"
                  else: "token_embd.weight"
-  let outW = outputWeightForLinear(m.getTensor(outTName), hp.nEmb, hp.nVocab)
-  let dNorm = cachedWeight("norm_or_output_norm.weight", norm)
-  let dOutW = cachedWeight("output.weight", outW)
+  let dNorm = loadF32Weight(if m.infos.hasKey("norm.weight"): "norm.weight"
+                            else: "output_norm.weight")
+  let outW = if m.infos[outTName].elemType == GgmlTypeF16:
+    cachedF16WeightAsF32("output.weight", m, outTName)
+  else:
+    let w = outputWeightForLinear(m.getTensor(outTName), hp.nEmb, hp.nVocab)
+    cachedWeight("output.weight", w)
 
   gpuRmsnormCols(xNormPtr, xPtr, dNorm.devicePtr, hp.nEmb, seqLen, hp.rmsEps, stream)
-  gpuLinearCol(xPtr, xNormPtr, dOutW.devicePtr, outW.shape[0], outW.shape[1], seqLen, stream)
+  gpuLinearCol(xPtr, xNormPtr, outW.devicePtr, outW.shape[0], outW.shape[1], seqLen, stream)
 
   result = newTensor(@[outW.shape[1], seqLen])
   let bytes = result.data.len * sizeof(float32)
