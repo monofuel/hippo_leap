@@ -2014,6 +2014,85 @@ proc gpuRopeAtPos*(x: pointer, nHead, headDim, ropeDim: int,
                                      ropeBaseArg, posArg, seqLenArg))
 
 # ---------------------------------------------------------------------------
+# Fused RoPE + KV store kernel
+# ---------------------------------------------------------------------------
+proc fusedRopeStoreKVKernel(
+  qData, kData, vData: ptr float32,
+  kCacheData, vCacheData: ptr float32,
+  thetaData: ptr float32,
+  nHeadQ, nHeadK, headDim, halfRope: cint,
+  kvDim, cacheCols, pos: cint
+) {.hippoGlobal.} =
+  let idx = cint(blockIdx.x * blockDim.x + threadIdx.x)
+  let qPairs = nHeadQ * halfRope
+  let kPairs = nHeadK * halfRope
+  let ropePairs = qPairs + kPairs
+  let kvElems = kvDim
+  let total = ropePairs + kvElems * 2'i32
+  if idx >= total:
+    return
+  let thetaArr = cast[ptr UncheckedArray[float32]](thetaData)
+  if idx < ropePairs:
+    let isK = idx >= qPairs
+    let localIdx = if isK: idx - qPairs else: idx
+    let x = if isK: cast[ptr UncheckedArray[float32]](kData)
+            else: cast[ptr UncheckedArray[float32]](qData)
+    let h = localIdx div halfRope
+    let i = localIdx mod halfRope
+    let hOffset = h * headDim
+    let angle = cfloat(pos) * thetaArr[i]
+    let c = cosf(angle)
+    let s = sinf(angle)
+    let idx0 = hOffset + 2'i32 * i
+    let idx1 = hOffset + 2'i32 * i + 1'i32
+    let v0 = x[idx0]
+    let v1 = x[idx1]
+    x[idx0] = v0 * c - v1 * s
+    x[idx1] = v0 * s + v1 * c
+    if isK:
+      let kc = cast[ptr UncheckedArray[float32]](kCacheData)
+      kc[idx0 * cacheCols + pos] = v0 * c - v1 * s
+      kc[idx1 * cacheCols + pos] = v0 * s + v1 * c
+  else:
+    let storeIdx = idx - ropePairs
+    let isV = storeIdx >= kvElems
+    let localIdx = if isV: storeIdx - kvElems else: storeIdx
+    if isV:
+      let vc = cast[ptr UncheckedArray[float32]](vCacheData)
+      let v = cast[ptr UncheckedArray[float32]](vData)
+      vc[localIdx * cacheCols + pos] = v[localIdx]
+    else:
+      let kc = cast[ptr UncheckedArray[float32]](kCacheData)
+      let k = cast[ptr UncheckedArray[float32]](kData)
+      let d = localIdx
+      let hk = d div headDim
+      let di = d mod headDim
+      if di >= 2'i32 * halfRope:
+        kc[d * cacheCols + pos] = k[d]
+
+proc gpuFusedRopeStoreKV*(q, k, v: pointer, kCache, vCache: pointer,
+                            nHeadQ, nHeadK, headDim, ropeDim: int,
+                            kvDim, cacheCols, pos: int,
+                            stream: HippoStream) =
+  let halfRope = ropeDim div 2
+  let ropePairs = nHeadQ * halfRope + nHeadK * halfRope
+  let kvElems = kvDim
+  let total = ropePairs + kvElems * 2
+  let grid = newDim3(((total + HippoBlockSize - 1) div HippoBlockSize).uint32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var qPtr = q; var kPtr = k; var vPtr = v
+  var kcPtr = kCache; var vcPtr = vCache
+  var thetaPtr = modelPtrs.ropeTheta
+  var nHQ = nHeadQ.cint; var nHK = nHeadK.cint
+  var hdArg = headDim.cint; var hrArg = halfRope.cint
+  var kvDimArg = kvDim.cint; var cacheColsArg = cacheCols.cint; var posArg = pos.cint
+  hippoLaunchKernel(fusedRopeStoreKVKernel, gridDim = grid, blockDim = blk,
+                    stream = stream,
+                    args = hippoArgs(qPtr, kPtr, vPtr, kcPtr, vcPtr, thetaPtr,
+                                     nHQ, nHK, hdArg, hrArg,
+                                     kvDimArg, cacheColsArg, posArg))
+
+# ---------------------------------------------------------------------------
 # KV store kernels
 # ---------------------------------------------------------------------------
 proc storeKVKernel(
@@ -2924,10 +3003,11 @@ proc forwardDecodeToken*(m: var Model, token: int32, cache: var KvCache): int32 
         gpuLinearColQuant(tmp2, xNormPtr, lw.wvQ, hp.nEmb, kvDim, lw.wvQType, stream)
       else:
         gpuLinearCol(tmp2, xNormPtr, lw.wv, hp.nEmb, kvDim, 1, stream)
-    gpuRopeQKDecode(tmp0, tmp1, hp.nHead, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, pos, stream)
-    gpuStoreKVPair(cache.gpuCache.k[layer].devicePtr, tmp1,
-                    cache.gpuCache.v[layer].devicePtr, tmp2,
-                    kvDim, 1, cache.gpuCache.maxLen, pos, stream)
+    gpuFusedRopeStoreKV(tmp0, tmp1, tmp2,
+                        cache.gpuCache.k[layer].devicePtr,
+                        cache.gpuCache.v[layer].devicePtr,
+                        hp.nHead, hp.nHeadKv, headDim, ropeDim,
+                        kvDim, cache.gpuCache.maxLen, pos, stream)
     gpuAttentionDecode(xNormPtr, tmp0, cache.gpuCache.k[layer].devicePtr,
                        cache.gpuCache.v[layer].devicePtr,
                        hp.nHead, hp.nHeadKv, headDim, pos + 1,
