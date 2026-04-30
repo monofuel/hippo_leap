@@ -71,6 +71,20 @@ var
   devWeightsPtr: pointer
   devBufsPtr: pointer
 
+type
+  DecodeStepConfig = object
+    tokenId: cint
+    pos: cint
+    seqLen: cint
+    cacheCols: cint
+
+var
+  mkStepConfig: DecodeStepConfig
+  mkStepConfigDev: pointer
+  mkStepConfigAlloc: HippoAllocRef
+  mkGraphExec: hipGraphExec_t
+  mkGraphCaptured: bool = false
+
 # ---------------------------------------------------------------------------
 # Q2K constants
 # ---------------------------------------------------------------------------
@@ -446,6 +460,106 @@ proc siluMulKernel(gate: ptr cfloat, up: ptr cfloat,
     let u = cast[ptr UncheckedArray[cfloat]](up)
     let x = g[tid]
     g[tid] = (x / (1.0f + expf(-x))) * u[tid]
+
+# ---------------------------------------------------------------------------
+# Graph-compatible kernel variants (read variable args from device config)
+# ---------------------------------------------------------------------------
+
+proc embeddingKernelG(dst: ptr cfloat, weight: ptr cfloat,
+                      cfg: ptr DecodeStepConfig, nEmb: cint) {.hippoGlobal.} =
+  let tid = cint(blockIdx.x) * cint(blockDim.x) + cint(threadIdx.x)
+  if tid < nEmb:
+    let w = cast[ptr UncheckedArray[cfloat]](weight)
+    let d = cast[ptr UncheckedArray[cfloat]](dst)
+    d[tid] = w[cfg.tokenId * nEmb + tid]
+
+proc ropeQKDecodeKernelG(q: ptr cfloat, k: ptr cfloat,
+                         theta: ptr cfloat,
+                         cfg: ptr DecodeStepConfig,
+                         nHeadQ: cint, nHeadK: cint, headDim: cint,
+                         ropeDim: cint) {.hippoGlobal.} =
+  let tid = cint(blockIdx.x) * cint(blockDim.x) + cint(threadIdx.x)
+  let halfRope = ropeDim div 2
+  let totalPairs = (nHeadQ + nHeadK) * halfRope
+  if tid >= totalPairs: return
+  let thetaArr = cast[ptr UncheckedArray[cfloat]](theta)
+  let isK = tid >= nHeadQ * halfRope
+  let head = if isK: (tid - nHeadQ * halfRope) div halfRope
+             else: tid div halfRope
+  let pairIdx = if isK: (tid - nHeadQ * halfRope) mod halfRope
+                else: tid mod halfRope
+  let basePtr = if isK: cast[ptr UncheckedArray[cfloat]](k)
+                else: cast[ptr UncheckedArray[cfloat]](q)
+  let offset = head * headDim + pairIdx
+  let freq = thetaArr[pairIdx] * cfloat(cfg.pos)
+  let cosVal = cosf(freq)
+  let sinVal = sinf(freq)
+  let v0 = basePtr[offset]
+  let v1 = basePtr[offset + halfRope]
+  basePtr[offset] = v0 * cosVal - v1 * sinVal
+  basePtr[offset + halfRope] = v0 * sinVal + v1 * cosVal
+
+proc storeKVPairKernelG(kCache: ptr cfloat, kSrc: ptr cfloat,
+                        vCache: ptr cfloat, vSrc: ptr cfloat,
+                        kvDim: cint, cacheCols: cint,
+                        cfg: ptr DecodeStepConfig) {.hippoGlobal.} =
+  let tid = cint(blockIdx.x) * cint(blockDim.x) + cint(threadIdx.x)
+  if tid < kvDim:
+    let kc = cast[ptr UncheckedArray[cfloat]](kCache)
+    let vc = cast[ptr UncheckedArray[cfloat]](vCache)
+    let ks = cast[ptr UncheckedArray[cfloat]](kSrc)
+    let vs = cast[ptr UncheckedArray[cfloat]](vSrc)
+    kc[tid * cacheCols + cfg.pos] = ks[tid]
+    vc[tid * cacheCols + cfg.pos] = vs[tid]
+
+proc attentionDecodeKernelG(dst: ptr cfloat, q: ptr cfloat,
+                            kCache: ptr cfloat, vCache: ptr cfloat,
+                            nHead: cint, nHeadKv: cint, headDim: cint,
+                            cfg: ptr DecodeStepConfig,
+                            cacheCols: cint) {.hippoGlobal.} =
+  let head = cint(blockIdx.x)
+  if head >= nHead: return
+  let tid = cint(threadIdx.x)
+  if tid >= cint(mkc.WarpSize): return
+  let qArr = cast[ptr UncheckedArray[cfloat]](q)
+  let kArr = cast[ptr UncheckedArray[cfloat]](kCache)
+  let vArr = cast[ptr UncheckedArray[cfloat]](vCache)
+  let dArr = cast[ptr UncheckedArray[cfloat]](dst)
+  let qOff = head * headDim
+  let kvHead = head div (nHead div nHeadKv)
+  let kvOff = kvHead * headDim
+  let scale = 1.0f / sqrtf(cfloat(headDim))
+  let q0 = qArr[qOff + tid]
+  let q1 = qArr[qOff + tid + 32]
+  var acc0: cfloat = 0.0
+  var acc1: cfloat = 0.0
+  var mS: cfloat = -1e30f
+  var sE: cfloat = 0.0f
+  var p: cint = 0
+  while p < cfg.seqLen:
+    var partial = q0 * kArr[(kvOff + tid) * cacheCols + p] +
+                  q1 * kArr[(kvOff + tid + 32) * cacheCols + p]
+    partial = partial + hippoShflDown(partial, 16)
+    partial = partial + hippoShflDown(partial, 8)
+    partial = partial + hippoShflDown(partial, 4)
+    partial = partial + hippoShflDown(partial, 2)
+    partial = partial + hippoShflDown(partial, 1)
+    let sc = hippoShfl(partial, 0) * scale
+    if sc > mS:
+      let corr = expf(mS - sc)
+      acc0 = acc0 * corr + vArr[(kvOff + tid) * cacheCols + p]
+      acc1 = acc1 * corr + vArr[(kvOff + tid + 32) * cacheCols + p]
+      sE = sE * corr + 1.0f
+      mS = sc
+    else:
+      let w = expf(sc - mS)
+      acc0 = acc0 + w * vArr[(kvOff + tid) * cacheCols + p]
+      acc1 = acc1 + w * vArr[(kvOff + tid + 32) * cacheCols + p]
+      sE = sE + w
+    p = p + 1
+  let invSum = 1.0f / sE
+  dArr[qOff + tid] = acc0 * invSum
+  dArr[qOff + tid + 32] = acc1 * invSum
 
 # ---------------------------------------------------------------------------
 # Device-side phase functions for persistent cooperative kernel
@@ -979,6 +1093,61 @@ proc gpuAdd(dst, src: pointer, dim: int) =
     stream = mkStream,
     args = hippoArgs(dstP, srcP, d))
 
+# Graph-mode dispatch wrappers (pass device-side config pointer)
+proc gpuEmbeddingG(dst, weight: pointer) =
+  var dstP = cast[ptr cfloat](dst)
+  var wP = cast[ptr cfloat](weight)
+  var cfgP = cast[ptr DecodeStepConfig](mkStepConfigDev)
+  var nEmb = cint(ModelCfg.nEmb)
+  hippoLaunchKernel(embeddingKernelG,
+    gridDim = grid1d(ModelCfg.nEmb), blockDim = block1d(),
+    stream = mkStream,
+    args = hippoArgs(dstP, wP, cfgP, nEmb))
+
+proc gpuRopeQKDecodeG(q, k, theta: pointer) =
+  var qP = cast[ptr cfloat](q)
+  var kP = cast[ptr cfloat](k)
+  var tP = cast[ptr cfloat](theta)
+  var cfgP = cast[ptr DecodeStepConfig](mkStepConfigDev)
+  var nHQ = cint(ModelCfg.nHead)
+  var nHK = cint(ModelCfg.nHeadKv)
+  var hDim = cint(ModelCfg.headDim)
+  var rDim = cint(ModelCfg.ropeDim)
+  let halfRope = ModelCfg.ropeDim div 2
+  let totalPairs = (ModelCfg.nHead + ModelCfg.nHeadKv) * halfRope
+  hippoLaunchKernel(ropeQKDecodeKernelG,
+    gridDim = grid1d(totalPairs), blockDim = block1d(),
+    stream = mkStream,
+    args = hippoArgs(qP, kP, tP, cfgP, nHQ, nHK, hDim, rDim))
+
+proc gpuStoreKVPairG(kCache, kSrc, vCache, vSrc: pointer, cacheCols: int) =
+  var kcP = cast[ptr cfloat](kCache)
+  var ksP = cast[ptr cfloat](kSrc)
+  var vcP = cast[ptr cfloat](vCache)
+  var vsP = cast[ptr cfloat](vSrc)
+  var kvd = cint(KvDim)
+  var cc = cint(cacheCols)
+  var cfgP = cast[ptr DecodeStepConfig](mkStepConfigDev)
+  hippoLaunchKernel(storeKVPairKernelG,
+    gridDim = grid1d(KvDim), blockDim = block1d(),
+    stream = mkStream,
+    args = hippoArgs(kcP, ksP, vcP, vsP, kvd, cc, cfgP))
+
+proc gpuAttentionDecodeG(dst, q, kCache, vCache: pointer, cacheCols: int) =
+  var dstP = cast[ptr cfloat](dst)
+  var qP = cast[ptr cfloat](q)
+  var kcP = cast[ptr cfloat](kCache)
+  var vcP = cast[ptr cfloat](vCache)
+  var nH = cint(ModelCfg.nHead)
+  var nHKv = cint(ModelCfg.nHeadKv)
+  var hDim = cint(ModelCfg.headDim)
+  var cfgP = cast[ptr DecodeStepConfig](mkStepConfigDev)
+  var cc = cint(cacheCols)
+  hippoLaunchKernel(attentionDecodeKernelG,
+    gridDim = newDim3(ModelCfg.nHead.uint32), blockDim = block1d(),
+    stream = mkStream,
+    args = hippoArgs(dstP, qP, kcP, vcP, nH, nHKv, hDim, cfgP, cc))
+
 proc gpuLinearF32(dst, x, w: pointer, inDim, outDim: int) =
   var dstP = cast[ptr cfloat](dst)
   var xP = cast[ptr cfloat](x)
@@ -1200,6 +1369,12 @@ proc loadModelBackend*(m: var Model, hp: HParams) =
     mkBuf.kvK[layer] = kAlloc.p
     mkBuf.kvV[layer] = vAlloc.p
 
+  # Step config for graph capture
+  mkStepConfigAlloc = hippoMalloc(sizeof(DecodeStepConfig))
+  mkBufAllocs.add(mkStepConfigAlloc)
+  mkStepConfigDev = mkStepConfigAlloc.p
+  mkGraphCaptured = false
+
   hippoStreamSynchronize(mkStream)
 
   # Upload weight/buffer structs to device for persistent kernel
@@ -1219,6 +1394,9 @@ proc loadModelBackend*(m: var Model, hp: HParams) =
 
 proc unloadModelBackend*() =
   if mkInitialized:
+    if mkGraphCaptured:
+      hippoGraphExecDestroy(mkGraphExec)
+      mkGraphCaptured = false
     mkWeightAllocs = @[]
     mkBufAllocs = @[]
     hippoStreamDestroy(mkStream)
@@ -1290,11 +1468,76 @@ proc forwardDecodeIndividual(token: int32, curLen: int): seq[float32] =
               HippoMemcpyDeviceToHost)
 
 # ---------------------------------------------------------------------------
+# Graph capture path: capture once, replay per token
+# ---------------------------------------------------------------------------
+
+proc forwardDecodeGraphBody() =
+  let cacheCols = mkMaxLen
+  gpuEmbeddingG(mkBuf.act0, mkWeights.tokEmb)
+
+  for layer in 0 ..< ModelCfg.nLayers:
+    let lw = mkWeights.layers[layer]
+    let kvK = mkBuf.kvK[layer]
+    let kvV = mkBuf.kvV[layer]
+
+    if layer == 0:
+      gpuRmsNorm(mkBuf.act1, mkBuf.act0, lw.attnNorm)
+
+    gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wq, ModelCfg.nEmb, QDim)
+    gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wk, ModelCfg.nEmb, KvDim)
+    gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
+    gpuRopeQKDecodeG(mkBuf.scratch0, mkBuf.scratch1, mkWeights.ropeTheta)
+    gpuStoreKVPairG(kvK, mkBuf.scratch1, kvV, mkBuf.scratch2, cacheCols)
+    gpuAttentionDecodeG(mkBuf.scratch1, mkBuf.scratch0, kvK, kvV, cacheCols)
+    gpuLinear(mkBuf.scratch0, mkBuf.scratch1, lw.wo, QDim, ModelCfg.nEmb)
+
+    gpuResidualRmsNorm(mkBuf.act1, mkBuf.act0, mkBuf.scratch0, lw.ffnNorm)
+    gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
+    gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
+    gpuSiluMul(mkBuf.scratch0, mkBuf.scratch1, ModelCfg.ffnDim)
+    gpuLinear(mkBuf.scratch1, mkBuf.scratch0, lw.wDown, ModelCfg.ffnDim, ModelCfg.nEmb)
+
+    if layer < ModelCfg.nLayers - 1:
+      gpuResidualRmsNorm(mkBuf.act1, mkBuf.act0, mkBuf.scratch1,
+                         mkWeights.layers[layer + 1].attnNorm)
+    else:
+      gpuAdd(mkBuf.act0, mkBuf.scratch1, ModelCfg.nEmb)
+
+  gpuRmsNorm(mkBuf.act1, mkBuf.act0, mkWeights.outputNorm)
+  gpuLinear(mkBuf.logits, mkBuf.act1, mkWeights.outputWeight,
+            ModelCfg.nEmb, ModelCfg.nVocab)
+
+proc forwardDecodeGraph(token: int32, curLen: int): seq[float32] =
+  mkStepConfig.tokenId = cint(token)
+  mkStepConfig.pos = cint(curLen)
+  mkStepConfig.seqLen = cint(curLen + 1)
+  mkStepConfig.cacheCols = cint(mkMaxLen)
+  hippoMemcpyAsync(mkStepConfigDev, cast[pointer](addr mkStepConfig),
+                   sizeof(DecodeStepConfig),
+                   HippoMemcpyHostToDevice, mkStream)
+
+  if not mkGraphCaptured:
+    hippoStreamBeginCapture(mkStream)
+    forwardDecodeGraphBody()
+    let graph = hippoStreamEndCapture(mkStream)
+    mkGraphExec = hippoGraphInstantiate(graph)
+    hippoGraphDestroy(graph)
+    mkGraphCaptured = true
+
+  hippoGraphLaunch(mkGraphExec, mkStream)
+  hippoStreamSynchronize(mkStream)
+  result = newSeq[float32](ModelCfg.nVocab)
+  hippoMemcpy(addr result[0], mkBuf.logits, ModelCfg.nVocab * sizeof(float32),
+              HippoMemcpyDeviceToHost)
+
+# ---------------------------------------------------------------------------
 # Backend interface: forward functions
 # ---------------------------------------------------------------------------
 
 proc forwardDecodeInternal(token: int32, curLen: int): seq[float32] =
-  when defined(useIndividualLaunches):
+  when defined(useGraphCapture):
+    forwardDecodeGraph(token, curLen)
+  elif defined(useIndividualLaunches):
     forwardDecodeIndividual(token, curLen)
   else:
     forwardDecodeCooperative(token, curLen)

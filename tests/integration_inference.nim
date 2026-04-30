@@ -70,6 +70,23 @@ proc testGenerateLoop() =
   echo &"Text: {result.text}"
   echo "[OK] generate() loop works"
 
+proc testBenchmark() =
+  if not fileExists(ModelPath):
+    echo "[SKIP] Model file not found: " & ModelPath
+    return
+
+  var ctx = loadInferenceContext(ModelPath, 512)
+  defer: unloadInferenceContext(ctx)
+
+  # Warmup (gets GPU clocks up)
+  discard generate(ctx, "Hello", 8)
+
+  # Reset cache and run timed benchmark
+  ctx.cache.curLen = 0
+  let result = generate(ctx, "The quick brown fox", 64)
+  echo &"Benchmark: {result.completionTokens} tokens in {result.elapsedMs:.1f}ms = {float64(result.completionTokens) / result.elapsedMs * 1000:.1f} tok/s"
+
 when isMainModule:
   testGoldenOutput()
   testGenerateLoop()
+  testBenchmark()
