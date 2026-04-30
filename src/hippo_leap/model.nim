@@ -11,11 +11,14 @@ const
   GgmlTypeF32* = 0
   GgmlTypeF16* = 1
   GgmlTypeQ5_0* = 6
+  GgmlTypeQ5_1* = 7
   GgmlTypeQ8_0* = 8
   GgmlTypeQ2K* = 10
   GgmlTypeQ3K* = 11
   GgmlTypeQ4K* = 12
+  GgmlTypeQ5K* = 13
   GgmlTypeQ6K* = 14
+  GgmlTypeIQ4NL* = 20
 
 type
   HParams* = object
@@ -41,6 +44,8 @@ type
     nExperts*: int
     nExpertsUsed*: int
     expertFfnDim*: int
+    sharedExpertFfnDim*: int
+    expertWeightsScale*: float32
     fullAttnInterval*: int
     ropeDimSections*: seq[int32]
 
@@ -109,12 +114,30 @@ proc loadTensorF32(g: GgufFile, info: GgufTensorInfo): Tensor =
       let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
       let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
       dequantRowQ4K(src, dst, rowLen)
+  of GgmlTypeQ5_1:
+    let rowSize = rowSizeQ5_1(rowLen)
+    for r in 0 ..< rows:
+      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
+      let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
+      dequantRowQ5_1(src, dst, rowLen)
+  of GgmlTypeQ5K:
+    let rowSize = rowSizeQ5K(rowLen)
+    for r in 0 ..< rows:
+      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
+      let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
+      dequantRowQ5K(src, dst, rowLen)
   of GgmlTypeQ6K:
     let rowSize = rowSizeQ6K(rowLen)
     for r in 0 ..< rows:
       let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
       let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
       dequantRowQ6K(src, dst, rowLen)
+  of GgmlTypeIQ4NL:
+    let rowSize = rowSizeIQ4NL(rowLen)
+    for r in 0 ..< rows:
+      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
+      let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
+      dequantRowIQ4NL(src, dst, rowLen)
   else:
     raise newException(ValueError, "unsupported ggml type: " & $info.elemType)
 
@@ -142,6 +165,8 @@ proc loadHParams(g: GgufFile): HParams =
   if g.getKvU32(prefix & "expert_count", v): result.nExperts = int(v)
   if g.getKvU32(prefix & "expert_used_count", v): result.nExpertsUsed = int(v)
   if g.getKvU32(prefix & "expert_feed_forward_length", v): result.expertFfnDim = int(v)
+  if g.getKvU32(prefix & "expert_shared_feed_forward_length", v): result.sharedExpertFfnDim = int(v)
+  if g.getKvF32(prefix & "expert_weights_scale", f): result.expertWeightsScale = f
   if g.getKvU32(prefix & "full_attention_interval", v): result.fullAttnInterval = int(v)
   var arrI32: seq[int32]
   if g.getKvArrI32(prefix & "feed_forward_length", arrI32):
@@ -154,6 +179,10 @@ proc loadHParams(g: GgufFile): HParams =
     result.headDim = result.nEmb div result.nHead
   if result.arch == "qwen35moe" and result.ssmGroupCount == 0 and result.ssmStateSize > 0:
     result.ssmGroupCount = result.ssmDtRank  # preliminary, may be corrected after tensor load
+  if result.sharedExpertFfnDim == 0 and result.expertFfnDim > 0:
+    result.sharedExpertFfnDim = result.expertFfnDim
+  if result.expertWeightsScale == 0.0'f32:
+    result.expertWeightsScale = 1.0'f32
   if result.ropeFreqBase == 0.0'f32:
     result.ropeFreqBase = 10000.0'f32
   if result.ropeDim == 0:

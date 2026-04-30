@@ -284,6 +284,9 @@ proc quantRowSize*(nCols: int, elemType: int32): int =
   of GgmlTypeQ4K: rowSizeQ4K(nCols)
   of GgmlTypeQ6K: rowSizeQ6K(nCols)
   of GgmlTypeQ8_0: rowSizeQ8_0(nCols)
+  of GgmlTypeQ5_1: rowSizeQ5_1(nCols)
+  of GgmlTypeQ5K: rowSizeQ5K(nCols)
+  of GgmlTypeIQ4NL: rowSizeIQ4NL(nCols)
   else: raise newException(ValueError, "unsupported quant type for row size: " & $elemType)
 
 proc cachedQuantWeight*(name: string, m: var Model, tensorName: string): GpuQuantWeight =
@@ -303,6 +306,9 @@ proc cachedQuantWeight*(name: string, m: var Model, tensorName: string): GpuQuan
     of GgmlTypeQ4K: rowSizeQ4K(nCols)
     of GgmlTypeQ6K: rowSizeQ6K(nCols)
     of GgmlTypeQ8_0: rowSizeQ8_0(nCols)
+    of GgmlTypeQ5_1: rowSizeQ5_1(nCols)
+    of GgmlTypeQ5K: rowSizeQ5K(nCols)
+    of GgmlTypeIQ4NL: rowSizeIQ4NL(nCols)
     else: raise newException(ValueError, "unsupported quant type for GPU upload: " & $info.elemType)
   let totalBytes = rowSize * nRows
   let alloc = hippoMalloc(totalBytes)
@@ -1126,6 +1132,210 @@ proc gpuLinearColQ5_0*(dst, x, wQuant: pointer, wCols, wRows: int,
     {.error: "gpuLinearColQ5_0 requires WarpSize == 32".}
 
 # ---------------------------------------------------------------------------
+# Q5_1 GEMV decode (warp-per-row, WarpSize==32 only)
+# ---------------------------------------------------------------------------
+when HippoWarpSize == 32:
+  proc linearQ5_1WarpDecodeKernel(
+    wData: ptr uint8,
+    xData, outData: ptr float32,
+    outRows, wCols: cint
+  ) {.hippoGlobal.} =
+    let tid = cint(threadIdx.x)
+    let row = cint(blockIdx.x)
+    if row >= outRows:
+      return
+    let w = cast[ptr UncheckedArray[uint8]](wData)
+    let xArr = cast[ptr UncheckedArray[float32]](xData)
+    let outArr = cast[ptr UncheckedArray[float32]](outData)
+    let nBlocksPerRow = wCols div 32'i32
+    let rowSizeBytes = nBlocksPerRow * 24'i32  # BlockQ5_1Size = 24
+    let rowBase = row * rowSizeBytes
+    var acc = 0.0'f32
+    var blkIdx = 0'i32
+    while blkIdx < nBlocksPerRow:
+      let bs = rowBase + blkIdx * 24'i32
+      let eb = blkIdx * 32'i32
+      let dRaw = uint16(w[bs]) or (uint16(w[bs + 1'i32]) shl 8)
+      let mRaw = uint16(w[bs + 2'i32]) or (uint16(w[bs + 3'i32]) shl 8)
+      let d = hippoHalfToFloat(dRaw)
+      let m = hippoHalfToFloat(mRaw)
+      let qhBits = uint32(w[bs + 4'i32]) or (uint32(w[bs + 5'i32]) shl 8) or
+                   (uint32(w[bs + 6'i32]) shl 16) or (uint32(w[bs + 7'i32]) shl 24)
+      let nibbleByte = w[bs + 8'i32 + (tid and 15'i32)]
+      let lo = if tid < 16'i32: nibbleByte and 0x0F'u8
+               else: nibbleByte shr 4
+      let hi = uint8((qhBits shr uint32(tid)) and 1'u32) shl 4
+      let qVal = cfloat(hi or lo)
+      acc = acc + (d * qVal + m) * xArr[eb + tid]
+      blkIdx = blkIdx + 1'i32
+    acc = acc + hippoShflDown(acc, 16)
+    acc = acc + hippoShflDown(acc, 8)
+    acc = acc + hippoShflDown(acc, 4)
+    acc = acc + hippoShflDown(acc, 2)
+    acc = acc + hippoShflDown(acc, 1)
+    if tid == 0'i32:
+      outArr[row] = acc
+
+proc gpuLinearColQ5_1*(dst, x, wQuant: pointer, wCols, wRows: int,
+                        stream: HippoStream) =
+  when HippoWarpSize == 32:
+    let grid = newDim3(wRows.uint32)
+    let blk = newDim3(HippoWarpSize.uint32)
+    var wPtr = wQuant; var xPtr = x; var dPtr = dst
+    var outRowsArg = wRows.cint; var wColsArg = wCols.cint
+    hippoLaunchKernel(linearQ5_1WarpDecodeKernel, gridDim = grid, blockDim = blk,
+                      stream = stream,
+                      args = hippoArgs(wPtr, xPtr, dPtr, outRowsArg, wColsArg))
+  else:
+    {.error: "gpuLinearColQ5_1 requires WarpSize == 32".}
+
+# ---------------------------------------------------------------------------
+# IQ4_NL GEMV decode (warp-per-row, WarpSize==32 only)
+# ---------------------------------------------------------------------------
+when HippoWarpSize == 32:
+  proc linearIQ4NLWarpDecodeKernel(
+    wData: ptr uint8,
+    xData, outData: ptr float32,
+    outRows, wCols: cint
+  ) {.hippoGlobal.} =
+    let tid = cint(threadIdx.x)
+    let row = cint(blockIdx.x)
+    if row >= outRows:
+      return
+    let w = cast[ptr UncheckedArray[uint8]](wData)
+    let xArr = cast[ptr UncheckedArray[float32]](xData)
+    let outArr = cast[ptr UncheckedArray[float32]](outData)
+    let nBlocksPerRow = wCols div 32'i32
+    let rowSizeBytes = nBlocksPerRow * 18'i32  # BlockIQ4NLSize = 18
+    let rowBase = row * rowSizeBytes
+    var acc = 0.0'f32
+    var blkIdx = 0'i32
+    while blkIdx < nBlocksPerRow:
+      let bs = rowBase + blkIdx * 18'i32
+      let eb = blkIdx * 32'i32
+      let dRaw = uint16(w[bs]) or (uint16(w[bs + 1'i32]) shl 8)
+      let d = hippoHalfToFloat(dRaw)
+      let nibbleByte = w[bs + 2'i32 + (tid and 15'i32)]
+      let nibble = if tid < 16'i32: nibbleByte and 0x0F'u8
+                   else: nibbleByte shr 4
+      # IQ4_NL lookup table (compile-time constant in registers)
+      var qVal: cint
+      case nibble
+      of 0'u8: qVal = -127'i32
+      of 1'u8: qVal = -104'i32
+      of 2'u8: qVal = -83'i32
+      of 3'u8: qVal = -65'i32
+      of 4'u8: qVal = -49'i32
+      of 5'u8: qVal = -35'i32
+      of 6'u8: qVal = -22'i32
+      of 7'u8: qVal = -10'i32
+      of 8'u8: qVal = 1'i32
+      of 9'u8: qVal = 13'i32
+      of 10'u8: qVal = 25'i32
+      of 11'u8: qVal = 38'i32
+      of 12'u8: qVal = 53'i32
+      of 13'u8: qVal = 69'i32
+      of 14'u8: qVal = 89'i32
+      else: qVal = 113'i32
+      acc = acc + d * cfloat(qVal) * xArr[eb + tid]
+      blkIdx = blkIdx + 1'i32
+    acc = acc + hippoShflDown(acc, 16)
+    acc = acc + hippoShflDown(acc, 8)
+    acc = acc + hippoShflDown(acc, 4)
+    acc = acc + hippoShflDown(acc, 2)
+    acc = acc + hippoShflDown(acc, 1)
+    if tid == 0'i32:
+      outArr[row] = acc
+
+proc gpuLinearColIQ4NL*(dst, x, wQuant: pointer, wCols, wRows: int,
+                         stream: HippoStream) =
+  when HippoWarpSize == 32:
+    let grid = newDim3(wRows.uint32)
+    let blk = newDim3(HippoWarpSize.uint32)
+    var wPtr = wQuant; var xPtr = x; var dPtr = dst
+    var outRowsArg = wRows.cint; var wColsArg = wCols.cint
+    hippoLaunchKernel(linearIQ4NLWarpDecodeKernel, gridDim = grid, blockDim = blk,
+                      stream = stream,
+                      args = hippoArgs(wPtr, xPtr, dPtr, outRowsArg, wColsArg))
+  else:
+    {.error: "gpuLinearColIQ4NL requires WarpSize == 32".}
+
+# ---------------------------------------------------------------------------
+# Q5_K GEMV decode (warp-per-row, WarpSize==32 only)
+# ---------------------------------------------------------------------------
+when HippoWarpSize == 32:
+  proc linearQ5KWarpDecodeKernel(
+    wData: ptr uint8,
+    xData, outData: ptr float32,
+    outRows, wCols: cint
+  ) {.hippoGlobal.} =
+    let tid = cint(threadIdx.x)
+    let row = cint(blockIdx.x)
+    if row >= outRows:
+      return
+    let w = cast[ptr UncheckedArray[uint8]](wData)
+    let xArr = cast[ptr UncheckedArray[float32]](xData)
+    let outArr = cast[ptr UncheckedArray[float32]](outData)
+    let nBlocksPerRow = wCols div 256'i32
+    let blockSizeBytes = 176'i32  # BlockQ5KSize
+    let rowBase = row * nBlocksPerRow * blockSizeBytes
+    var acc = 0.0'f32
+    var blkIdx = 0'i32
+    while blkIdx < nBlocksPerRow:
+      let bs = rowBase + blkIdx * blockSizeBytes
+      let dRaw = uint16(w[bs]) or (uint16(w[bs + 1'i32]) shl 8)
+      let dminRaw = uint16(w[bs + 2'i32]) or (uint16(w[bs + 3'i32]) shl 8)
+      let d = hippoHalfToFloat(dRaw)
+      let dmin = hippoHalfToFloat(dminRaw)
+      let scales = cast[ptr UncheckedArray[uint8]](addr w[bs + 4'i32])
+      let qh = cast[ptr UncheckedArray[uint8]](addr w[bs + 16'i32])
+      let qs = cast[ptr UncheckedArray[uint8]](addr w[bs + 16'i32 + 32'i32])
+      let elemBase = blkIdx * 256'i32
+      for subBlock in 0'i32 ..< 8'i32:
+        let isIdx = subBlock
+        var sc, mn: uint8
+        if isIdx < 4'i32:
+          sc = scales[isIdx] and 63'u8
+          mn = scales[isIdx + 4'i32] and 63'u8
+        else:
+          sc = (scales[isIdx + 4'i32] and 0x0F'u8) or ((scales[isIdx - 4'i32] shr 6'u8) shl 4'u8)
+          mn = (scales[isIdx + 4'i32] shr 4'u8) or ((scales[isIdx] shr 6'u8) shl 4'u8)
+        let dl = d * cfloat(sc)
+        let ml = dmin * cfloat(mn)
+        let subBase = subBlock * 32'i32
+        let qOff = (subBlock div 2'i32) * 32'i32
+        let qShift = if (subBlock and 1'i32) == 0'i32: 0'i32 else: 4'i32
+        let qhBitIdx = subBlock div 2'i32
+        if tid < 32'i32:
+          let qByte = qs[qOff + tid]
+          let nibble = if qShift == 0'i32: qByte and 0x0F'u8
+                       else: qByte shr 4
+          let hBit = uint8((qh[tid] shr uint8(qhBitIdx * 2'i32 + (subBlock and 1'i32))) and 1'u8) shl 4
+          let qVal = cfloat(nibble or hBit)
+          acc = acc + (dl * qVal - ml) * xArr[elemBase + subBase + tid]
+      blkIdx = blkIdx + 1'i32
+    acc = acc + hippoShflDown(acc, 16)
+    acc = acc + hippoShflDown(acc, 8)
+    acc = acc + hippoShflDown(acc, 4)
+    acc = acc + hippoShflDown(acc, 2)
+    acc = acc + hippoShflDown(acc, 1)
+    if tid == 0'i32:
+      outArr[row] = acc
+
+proc gpuLinearColQ5K*(dst, x, wQuant: pointer, wCols, wRows: int,
+                       stream: HippoStream) =
+  when HippoWarpSize == 32:
+    let grid = newDim3(wRows.uint32)
+    let blk = newDim3(HippoWarpSize.uint32)
+    var wPtr = wQuant; var xPtr = x; var dPtr = dst
+    var outRowsArg = wRows.cint; var wColsArg = wCols.cint
+    hippoLaunchKernel(linearQ5KWarpDecodeKernel, gridDim = grid, blockDim = blk,
+                      stream = stream,
+                      args = hippoArgs(wPtr, xPtr, dPtr, outRowsArg, wColsArg))
+  else:
+    {.error: "gpuLinearColQ5K requires WarpSize == 32".}
+
+# ---------------------------------------------------------------------------
 # F16 GEMV decode (warp-per-row, WarpSize==32 only)
 # ---------------------------------------------------------------------------
 when HippoWarpSize == 32:
@@ -1378,6 +1588,9 @@ proc gpuLinearColQuant*(dst, x, wQuant: pointer, wCols, wRows: int,
   of GgmlTypeQ4K: gpuLinearColQ4K(dst, x, wQuant, wCols, wRows, stream)
   of GgmlTypeQ6K: gpuLinearColQ6K(dst, x, wQuant, wCols, wRows, stream)
   of GgmlTypeQ8_0: gpuLinearColQ8_0(dst, x, wQuant, wCols, wRows, stream)
+  of GgmlTypeQ5_1: gpuLinearColQ5_1(dst, x, wQuant, wCols, wRows, stream)
+  of GgmlTypeQ5K: gpuLinearColQ5K(dst, x, wQuant, wCols, wRows, stream)
+  of GgmlTypeIQ4NL: gpuLinearColIQ4NL(dst, x, wQuant, wCols, wRows, stream)
   else: raise newException(ValueError, "unsupported quant type for GPU GEMV: " & $quantType)
 
 # ---------------------------------------------------------------------------
@@ -3419,10 +3632,11 @@ proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
       let tn = lp & tensorSuffix
       let et = m.infos[tn].elemType.int32
       if et == GgmlTypeF16.int32 or
-         et == GgmlTypeQ5_0.int32 or
+         et == GgmlTypeQ5_0.int32 or et == GgmlTypeQ5_1.int32 or
          et == GgmlTypeQ2K.int32 or et == GgmlTypeQ3K.int32 or
-         et == GgmlTypeQ4K.int32 or et == GgmlTypeQ6K.int32 or
-         et == GgmlTypeQ8_0.int32:
+         et == GgmlTypeQ4K.int32 or et == GgmlTypeQ5K.int32 or
+         et == GgmlTypeQ6K.int32 or et == GgmlTypeQ8_0.int32 or
+         et == GgmlTypeIQ4NL.int32:
         let qw = cachedQuantWeight(tn, m, tn)
         quantField = qw.devicePtr
         fp32Field = nil
@@ -3440,6 +3654,10 @@ proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
         lw.kind = lkAttnMoe
     elif m.infos.hasKey(lp & "ssm_in.weight"):
       lw.kind = lkSsm
+    elif m.infos.hasKey(lp & "ffn_gate_inp.weight") and
+         not m.infos.hasKey(lp & "attn_q.weight") and
+         not m.infos.hasKey(lp & "attn_qkv.weight"):
+      lw.kind = lkMoeFfn
     elif hp.layerNHeadKv.len > layer and hp.layerNHeadKv[layer] > 0:
       if m.infos.hasKey(lp & "ffn_gate.weight") or m.infos.hasKey(lp & "ffn_up.weight"):
         lw.kind = lkAttentionFfn
@@ -3491,6 +3709,26 @@ proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
       lw.ssmA = loadF32Ptr(lp & "ssm_a")
       lw.ssmD = loadF32Ptr(lp & "ssm_d")
       lw.ssmNorm = loadF32Ptr(lp & "ssm_norm.weight")
+
+    of lkMoeFfn:
+      if m.infos.hasKey(lp & "ffn_norm.weight"):
+        lw.ffnNorm = loadF32Ptr(lp & "ffn_norm.weight")
+      lw.moeRouterW = loadF32Ptr(lp & "ffn_gate_inp.weight")
+      if m.infos.hasKey(lp & "exp_probs_b.bias"):
+        lw.moeExpertBias = loadF32Ptr(lp & "exp_probs_b.bias")
+      block:
+        let utn = lp & "ffn_up_exps.weight"
+        let uInfo = m.infos[utn]
+        lw.moeUpExpsQ = cachedQuantWeight(utn, m, utn).devicePtr
+        lw.moeUpExpsQType = uInfo.elemType
+        lw.moeUpExpsSliceBytes = quantRowSize(int(uInfo.ne[0]), uInfo.elemType) * int(uInfo.ne[1])
+        let dtn = lp & "ffn_down_exps.weight"
+        let dInfo = m.infos[dtn]
+        lw.moeDownExpsQ = cachedQuantWeight(dtn, m, dtn).devicePtr
+        lw.moeDownExpsQType = dInfo.elemType
+        lw.moeDownExpsSliceBytes = quantRowSize(int(dInfo.ne[0]), dInfo.elemType) * int(dInfo.ne[1])
+      uploadWeight(lw.wUp, lw.moeShUpQ, lw.moeShUpQType, "ffn_up_shexp.weight")
+      uploadWeight(lw.wDown, lw.moeShDownQ, lw.moeShDownQType, "ffn_down_shexp.weight")
 
     of lkAttnMoe:
       lw.postAttnNorm = loadF32Ptr(lp & "post_attention_norm.weight")
@@ -3581,7 +3819,10 @@ proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
      outElemType == GgmlTypeQ5_0.int32 or
      outElemType == GgmlTypeQ2K.int32 or outElemType == GgmlTypeQ3K.int32 or
      outElemType == GgmlTypeQ4K.int32 or outElemType == GgmlTypeQ6K.int32 or
-     outElemType == GgmlTypeQ8_0.int32:
+     outElemType == GgmlTypeQ8_0.int32 or
+     outElemType == GgmlTypeQ5_1.int32 or
+     outElemType == GgmlTypeQ5K.int32 or
+     outElemType == GgmlTypeIQ4NL.int32:
     let qw = cachedQuantWeight("output.weight", m, outTensorName)
     modelPtrs.outputWeightQ = qw.devicePtr
     modelPtrs.outputWeight = nil
@@ -3725,7 +3966,7 @@ proc unloadModelBackend*() =
 # ---------------------------------------------------------------------------
 proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tensor =
   let hp = m.hparams
-  if hp.arch != "" and hp.arch notin ["llama", "qwen3", "nemotron_h", "qwen35moe"]:
+  if hp.arch != "" and hp.arch notin ["llama", "qwen3", "nemotron_h", "nemotron_h_moe", "qwen35moe"]:
     raise newException(ValueError, "unsupported architecture: " & hp.arch)
   if hp.nHeadKv != 0 and hp.nHead > 0 and (hp.nHead mod hp.nHeadKv) != 0:
     raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
@@ -3751,6 +3992,7 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
   if hp.nExperts > 0:
     maxRows = max(maxRows, hp.nExperts)
     maxRows = max(maxRows, qDim + 2 * kvDim)
+    maxRows = max(maxRows, hp.sharedExpertFfnDim)
   ensureActivationBuffers(maxRows * seqLen)
   ensureScratchBuffers(maxRows * seqLen)
   let stream = gpuCtx.stream
@@ -3872,6 +4114,46 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
       gpuReluSqr(tmp0, lnFfn * seqLen, stream)
       gpuLinearCol(tmp0, tmp0, dWDown.devicePtr, lnFfn, hp.nEmb, seqLen, stream)
       gpuAdd(xPtr, xPtr, tmp0, hp.nEmb * seqLen, stream)
+
+    of lkMoeFfn:
+      gpuRmsnormCols(xNormPtr, xPtr, dAttnNorm.devicePtr, hp.nEmb, seqLen, hp.rmsEps, stream)
+      let shFfn = hp.sharedExpertFfnDim
+      for t in 0 ..< seqLen:
+        gpuGatherCol(tmp2, xNormPtr, hp.nEmb, seqLen, t, stream)
+        gpuLinearCol(tmp0, tmp2, lw.moeRouterW, hp.nEmb, hp.nExperts, 1, stream)
+        if lw.moeExpertBias != nil:
+          gpuAdd(tmp0, tmp0, lw.moeExpertBias, hp.nExperts, stream)
+        let eiPtr = tmp3
+        let ewPtr = cast[pointer](cast[uint](tmp3) + uint(hp.nExpertsUsed * sizeof(int32)))
+        gpuMoeTopK(eiPtr, ewPtr, tmp0, hp.nExperts, hp.nExpertsUsed, stream)
+        var expertIndices: array[32, int32]
+        var expertWeights: array[32, float32]
+        gpuDownloadFromDevice(addr expertIndices[0], eiPtr, hp.nExpertsUsed * sizeof(int32), stream)
+        gpuDownloadFromDevice(addr expertWeights[0], ewPtr, hp.nExpertsUsed * sizeof(float32), stream)
+        gpuStreamSync(stream)
+        for e in 0 ..< hp.nExpertsUsed:
+          expertWeights[e] *= hp.expertWeightsScale
+        gpuZeroBuffer(tmp1, hp.nEmb, stream)
+        for e in 0 ..< hp.nExpertsUsed:
+          let eidx = int(expertIndices[e])
+          let upOff = cast[pointer](cast[uint](lw.moeUpExpsQ) + uint(eidx * lw.moeUpExpsSliceBytes))
+          gpuLinearColQuant(tmp0, tmp2, upOff, hp.nEmb, hp.expertFfnDim, lw.moeUpExpsQType, stream)
+          gpuReluSqr(tmp0, hp.expertFfnDim, stream)
+          let downOff = cast[pointer](cast[uint](lw.moeDownExpsQ) + uint(eidx * lw.moeDownExpsSliceBytes))
+          gpuLinearColQuant(tmp3, tmp0, downOff, hp.expertFfnDim, hp.nEmb, lw.moeDownExpsQType, stream)
+          gpuScaleAdd(tmp1, tmp3, expertWeights[e], hp.nEmb, stream)
+        if lw.moeShUpQ != nil:
+          gpuLinearColQuant(tmp0, tmp2, lw.moeShUpQ, hp.nEmb, shFfn, lw.moeShUpQType, stream)
+        else:
+          gpuLinearCol(tmp0, tmp2, lw.wUp, hp.nEmb, shFfn, 1, stream)
+        gpuReluSqr(tmp0, shFfn, stream)
+        if lw.moeShDownQ != nil:
+          gpuLinearColQuant(tmp3, tmp0, lw.moeShDownQ, shFfn, hp.nEmb, lw.moeShDownQType, stream)
+        else:
+          gpuLinearCol(tmp3, tmp0, lw.wDown, shFfn, hp.nEmb, 1, stream)
+        gpuAdd(tmp0, tmp1, tmp3, hp.nEmb, stream)
+        gpuScatterAddCol(xPtr, tmp0, hp.nEmb, seqLen, t, stream)
+      continue
 
     of lkSsm:
       # SSM prefill: process each token sequentially through the recurrence
@@ -4309,7 +4591,7 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
 # ---------------------------------------------------------------------------
 proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
   let hp = m.hparams
-  if hp.arch != "" and hp.arch notin ["llama", "qwen3", "nemotron_h", "qwen35moe"]:
+  if hp.arch != "" and hp.arch notin ["llama", "qwen3", "nemotron_h", "nemotron_h_moe", "qwen35moe"]:
     raise newException(ValueError, "unsupported architecture: " & hp.arch)
   if hp.nHeadKv != 0 and hp.nHead > 0 and (hp.nHead mod hp.nHeadKv) != 0:
     raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
@@ -4333,6 +4615,7 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
   if hp.nExperts > 0:
     maxRows = max(maxRows, hp.nExperts)
     maxRows = max(maxRows, qDim + 2 * kvDim)
+    maxRows = max(maxRows, hp.sharedExpertFfnDim)
   ensureActivationBuffers(maxRows)
   ensureScratchBuffers(maxRows)
   let stream = gpuCtx.stream
@@ -4526,6 +4809,42 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
         gpuLinearColQuant(tmp0, tmp0, lw.wDownQ, lnFfn, hp.nEmb, lw.wDownQType, stream)
       else:
         gpuLinearCol(tmp0, tmp0, lw.wDown, lnFfn, hp.nEmb, 1, stream)
+
+    of lkMoeFfn:
+      gpuLinearCol(tmp0, xNormPtr, lw.moeRouterW, hp.nEmb, hp.nExperts, 1, stream)
+      if lw.moeExpertBias != nil:
+        gpuAdd(tmp0, tmp0, lw.moeExpertBias, hp.nExperts, stream)
+      block:
+        let eiPtr = tmp3
+        let ewPtr = cast[pointer](cast[uint](tmp3) + uint(hp.nExpertsUsed * sizeof(int32)))
+        gpuMoeTopK(eiPtr, ewPtr, tmp0, hp.nExperts, hp.nExpertsUsed, stream)
+        var expertIndices: array[32, int32]
+        var expertWeights: array[32, float32]
+        gpuDownloadFromDevice(addr expertIndices[0], eiPtr, hp.nExpertsUsed * sizeof(int32), stream)
+        gpuDownloadFromDevice(addr expertWeights[0], ewPtr, hp.nExpertsUsed * sizeof(float32), stream)
+        gpuStreamSync(stream)
+        for e in 0 ..< hp.nExpertsUsed:
+          expertWeights[e] *= hp.expertWeightsScale
+        gpuZeroBuffer(tmp2, hp.nEmb, stream)
+        for e in 0 ..< hp.nExpertsUsed:
+          let eidx = int(expertIndices[e])
+          let upOff = cast[pointer](cast[uint](lw.moeUpExpsQ) + uint(eidx * lw.moeUpExpsSliceBytes))
+          gpuLinearColQuant(tmp0, xNormPtr, upOff, hp.nEmb, hp.expertFfnDim, lw.moeUpExpsQType, stream)
+          gpuReluSqr(tmp0, hp.expertFfnDim, stream)
+          let downOff = cast[pointer](cast[uint](lw.moeDownExpsQ) + uint(eidx * lw.moeDownExpsSliceBytes))
+          gpuLinearColQuant(tmp1, tmp0, downOff, hp.expertFfnDim, hp.nEmb, lw.moeDownExpsQType, stream)
+          gpuScaleAdd(tmp2, tmp1, expertWeights[e], hp.nEmb, stream)
+        let shFfn = hp.sharedExpertFfnDim
+        if lw.moeShUpQ != nil:
+          gpuLinearColQuant(tmp0, xNormPtr, lw.moeShUpQ, hp.nEmb, shFfn, lw.moeShUpQType, stream)
+        else:
+          gpuLinearCol(tmp0, xNormPtr, lw.wUp, hp.nEmb, shFfn, 1, stream)
+        gpuReluSqr(tmp0, shFfn, stream)
+        if lw.moeShDownQ != nil:
+          gpuLinearColQuant(tmp1, tmp0, lw.moeShDownQ, shFfn, hp.nEmb, lw.moeShDownQType, stream)
+        else:
+          gpuLinearCol(tmp1, tmp0, lw.wDown, shFfn, hp.nEmb, 1, stream)
+        gpuAdd(tmp0, tmp2, tmp1, hp.nEmb, stream)
 
     of lkSsm:
       let ssmInner = hp.ssmInnerSize
@@ -4782,7 +5101,7 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
 
 proc forwardDecodeToken*(m: var Model, token: int32, cache: var KvCache): int32 =
   let hp = m.hparams
-  if hp.arch != "" and hp.arch notin ["llama", "qwen3", "nemotron_h", "qwen35moe"]:
+  if hp.arch != "" and hp.arch notin ["llama", "qwen3", "nemotron_h", "nemotron_h_moe", "qwen35moe"]:
     raise newException(ValueError, "unsupported architecture: " & hp.arch)
   if hp.nHeadKv != 0 and hp.nHead > 0 and (hp.nHead mod hp.nHeadKv) != 0:
     raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
@@ -4806,6 +5125,7 @@ proc forwardDecodeToken*(m: var Model, token: int32, cache: var KvCache): int32 
   if hp.nExperts > 0:
     maxRows = max(maxRows, hp.nExperts)
     maxRows = max(maxRows, qDim + 2 * kvDim)
+    maxRows = max(maxRows, hp.sharedExpertFfnDim)
   ensureActivationBuffers(maxRows)
   ensureScratchBuffers(maxRows)
   let stream = gpuCtx.stream
@@ -4949,6 +5269,42 @@ proc forwardDecodeToken*(m: var Model, token: int32, cache: var KvCache): int32 
         gpuLinearColQuant(tmp0, tmp0, lw.wDownQ, lnFfn, hp.nEmb, lw.wDownQType, stream)
       else:
         gpuLinearCol(tmp0, tmp0, lw.wDown, lnFfn, hp.nEmb, 1, stream)
+
+    of lkMoeFfn:
+      gpuLinearCol(tmp0, xNormPtr, lw.moeRouterW, hp.nEmb, hp.nExperts, 1, stream)
+      if lw.moeExpertBias != nil:
+        gpuAdd(tmp0, tmp0, lw.moeExpertBias, hp.nExperts, stream)
+      block:
+        let eiPtr = tmp3
+        let ewPtr = cast[pointer](cast[uint](tmp3) + uint(hp.nExpertsUsed * sizeof(int32)))
+        gpuMoeTopK(eiPtr, ewPtr, tmp0, hp.nExperts, hp.nExpertsUsed, stream)
+        var expertIndices: array[32, int32]
+        var expertWeights: array[32, float32]
+        gpuDownloadFromDevice(addr expertIndices[0], eiPtr, hp.nExpertsUsed * sizeof(int32), stream)
+        gpuDownloadFromDevice(addr expertWeights[0], ewPtr, hp.nExpertsUsed * sizeof(float32), stream)
+        gpuStreamSync(stream)
+        for e in 0 ..< hp.nExpertsUsed:
+          expertWeights[e] *= hp.expertWeightsScale
+        gpuZeroBuffer(tmp2, hp.nEmb, stream)
+        for e in 0 ..< hp.nExpertsUsed:
+          let eidx = int(expertIndices[e])
+          let upOff = cast[pointer](cast[uint](lw.moeUpExpsQ) + uint(eidx * lw.moeUpExpsSliceBytes))
+          gpuLinearColQuant(tmp0, xNormPtr, upOff, hp.nEmb, hp.expertFfnDim, lw.moeUpExpsQType, stream)
+          gpuReluSqr(tmp0, hp.expertFfnDim, stream)
+          let downOff = cast[pointer](cast[uint](lw.moeDownExpsQ) + uint(eidx * lw.moeDownExpsSliceBytes))
+          gpuLinearColQuant(tmp1, tmp0, downOff, hp.expertFfnDim, hp.nEmb, lw.moeDownExpsQType, stream)
+          gpuScaleAdd(tmp2, tmp1, expertWeights[e], hp.nEmb, stream)
+        let shFfn = hp.sharedExpertFfnDim
+        if lw.moeShUpQ != nil:
+          gpuLinearColQuant(tmp0, xNormPtr, lw.moeShUpQ, hp.nEmb, shFfn, lw.moeShUpQType, stream)
+        else:
+          gpuLinearCol(tmp0, xNormPtr, lw.wUp, hp.nEmb, shFfn, 1, stream)
+        gpuReluSqr(tmp0, shFfn, stream)
+        if lw.moeShDownQ != nil:
+          gpuLinearColQuant(tmp1, tmp0, lw.moeShDownQ, shFfn, hp.nEmb, lw.moeShDownQType, stream)
+        else:
+          gpuLinearCol(tmp1, tmp0, lw.wDown, shFfn, hp.nEmb, 1, stream)
+        gpuAdd(tmp0, tmp2, tmp1, hp.nEmb, stream)
 
     of lkSsm:
       let ssmInner = hp.ssmInnerSize

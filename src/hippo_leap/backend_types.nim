@@ -17,6 +17,7 @@ type
     lkSsm
     lkSsmAttnMoe
     lkAttnMoe
+    lkMoeFfn
 
   GpuTensor* = object
     devicePtr*: pointer
@@ -95,6 +96,8 @@ type
     # Qwen3.6 SSM (alpha/beta formulation)
     ssmAlphaQ*, ssmBetaQ*: pointer
     ssmAlphaQType*, ssmBetaQType*: int32
+    # MoE router bias (Nemotron 3 30B)
+    moeExpertBias*: pointer
 
   ModelGpuPtrs* = object
     layers*: seq[LayerGpuPtrs]
