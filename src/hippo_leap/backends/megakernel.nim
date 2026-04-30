@@ -769,6 +769,7 @@ proc megakernelDecode(
     ropePhase(s0, s1, cast[ptr cfloat](weights.ropeTheta),
               cint(ModelCfg.nHead), cint(ModelCfg.nHeadKv), cint(ModelCfg.headDim),
               cint(ModelCfg.ropeDim), curLen)
+    gridSync()
     storeKVPhase(kvK, s1, kvV, s2, cint(KvDim), cacheCols, curLen)
     gridSync()
 
