@@ -4,7 +4,7 @@
 ## Only the initial token IDs are uploaded and final logits downloaded.
 
 import
-  std/[tables, math],
+  std/[tables, math, strformat, strutils],
   hippo,
   ../[backend_types, tensor, model, gguf_loader, quant]
 
@@ -258,6 +258,7 @@ proc ensureScratchBuffers*(nElems: int) =
     gpuCtx.scratch0 = newGpuTensor(@[nElems])
     gpuCtx.scratch1 = newGpuTensor(@[nElems])
     gpuCtx.scratch2 = newGpuTensor(@[nElems])
+    gpuCtx.scratch3 = newGpuTensor(@[nElems])
     gpuCtx.scratchCapBytes = bytes
 
 proc cachedWeight*(name: string, w: Tensor): GpuTensor =
@@ -273,6 +274,17 @@ proc cachedWeight*(w: Tensor): GpuTensor =
   ## Uncached fallback — uploads every time.
   ensureGpuContext()
   uploadToGpu(w, gpuCtx.stream)
+
+proc quantRowSize*(nCols: int, elemType: int32): int =
+  case elemType
+  of GgmlTypeF16: rowSizeF16(nCols)
+  of GgmlTypeQ5_0: rowSizeQ5_0(nCols)
+  of GgmlTypeQ2K: rowSizeQ2K(nCols)
+  of GgmlTypeQ3K: rowSizeQ3K(nCols)
+  of GgmlTypeQ4K: rowSizeQ4K(nCols)
+  of GgmlTypeQ6K: rowSizeQ6K(nCols)
+  of GgmlTypeQ8_0: rowSizeQ8_0(nCols)
+  else: raise newException(ValueError, "unsupported quant type for row size: " & $elemType)
 
 proc cachedQuantWeight*(name: string, m: var Model, tensorName: string): GpuQuantWeight =
   ## Upload raw quantized bytes to GPU once; return cached GpuQuantWeight.
@@ -2043,6 +2055,391 @@ proc gpuElemMul*(a, b: pointer, nElems: int, stream: HippoStream) =
                     stream = stream, args = hippoArgs(aPtr, bPtr, n))
 
 # ---------------------------------------------------------------------------
+# MoE utility kernels
+# ---------------------------------------------------------------------------
+proc scaleAddKernel(dstData, srcData: ptr float32, scale: float32, n: cint) {.hippoGlobal.} =
+  let idx = int(blockIdx.x * blockDim.x + threadIdx.x)
+  if idx < int(n):
+    let d = cast[ptr UncheckedArray[float32]](dstData)
+    let s = cast[ptr UncheckedArray[float32]](srcData)
+    d[idx] = d[idx] + scale * s[idx]
+
+proc gpuScaleAdd*(dst, src: pointer, scale: float32, nElems: int, stream: HippoStream) =
+  let grid = newDim3(((nElems + HippoBlockSize - 1) div HippoBlockSize).uint32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var dPtr = dst; var sPtr = src; var sc = scale; var n = nElems.cint
+  hippoLaunchKernel(scaleAddKernel, gridDim = grid, blockDim = blk,
+                    stream = stream, args = hippoArgs(dPtr, sPtr, sc, n))
+
+proc attnGateKernel(dstData, gateData: ptr float32, n: cint) {.hippoGlobal.} =
+  let idx = int(blockIdx.x * blockDim.x + threadIdx.x)
+  if idx < int(n):
+    let d = cast[ptr UncheckedArray[float32]](dstData)
+    let g = cast[ptr UncheckedArray[float32]](gateData)
+    let sig = 1.0'f32 / (1.0'f32 + expf(-g[idx]))
+    d[idx] = sig * d[idx]
+
+proc gpuAttnGate*(dst, gate: pointer, nElems: int, stream: HippoStream) =
+  let grid = newDim3(((nElems + HippoBlockSize - 1) div HippoBlockSize).uint32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var dPtr = dst; var gPtr = gate; var n = nElems.cint
+  hippoLaunchKernel(attnGateKernel, gridDim = grid, blockDim = blk,
+                    stream = stream, args = hippoArgs(dPtr, gPtr, n))
+
+proc sharedExpertGateKernel(outputData, inputData, gateWeightData: ptr float32,
+                             nElems: cint) {.hippoGlobal.} =
+  var sdata {.hippoShared.}: array[HippoBlockSize, float32]
+  let tid = int(threadIdx.x)
+  let g = cast[ptr UncheckedArray[float32]](gateWeightData)
+  let x = cast[ptr UncheckedArray[float32]](inputData)
+  let o = cast[ptr UncheckedArray[float32]](outputData)
+  var acc = 0.0'f32
+  var i = tid
+  while i < int(nElems):
+    acc = acc + g[i] * x[i]
+    i = i + int(blockDim.x)
+  sdata[tid] = acc
+  hippoSyncthreads()
+  reduceSum256(sdata, tid)
+  var sigVal {.hippoShared.}: array[1, float32]
+  if tid == 0:
+    sigVal[0] = 1.0'f32 / (1.0'f32 + expf(-sdata[0]))
+  hippoSyncthreads()
+  let sv = sigVal[0]
+  i = tid
+  while i < int(nElems):
+    o[i] = o[i] * sv
+    i = i + int(blockDim.x)
+
+proc gpuSharedExpertGate*(output, input, gateWeight: pointer,
+                           nElems: int, stream: HippoStream) =
+  let grid = newDim3(1'u32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var oPtr = output; var iPtr = input; var gPtr = gateWeight; var n = nElems.cint
+  hippoLaunchKernel(sharedExpertGateKernel, gridDim = grid, blockDim = blk,
+                    stream = stream, args = hippoArgs(oPtr, iPtr, gPtr, n))
+
+proc moeTopKKernel(logitsData: ptr float32,
+                    expertIndicesData: ptr int32,
+                    expertWeightsData: ptr float32,
+                    nExperts, K: cint) {.hippoGlobal.} =
+  let tid = int(threadIdx.x)
+  let logits = cast[ptr UncheckedArray[float32]](logitsData)
+  let indices = cast[ptr UncheckedArray[int32]](expertIndicesData)
+  let weights = cast[ptr UncheckedArray[float32]](expertWeightsData)
+  if tid != 0: return
+  # Softmax over all experts first
+  var maxVal = logits[0]
+  for e in 1 ..< int(nExperts):
+    if logits[e] > maxVal: maxVal = logits[e]
+  var sumExp = 0.0'f32
+  for e in 0 ..< int(nExperts):
+    logits[e] = expf(logits[e] - maxVal)
+    sumExp = sumExp + logits[e]
+  let invSum = 1.0'f32 / sumExp
+  for e in 0 ..< int(nExperts):
+    logits[e] = logits[e] * invSum
+  # Top-K from softmaxed probabilities
+  for k in 0 ..< int(K):
+    var bestVal = -1e30'f32
+    var bestIdx: int32 = 0
+    for e in 0 ..< int(nExperts):
+      var already = false
+      for j in 0 ..< k:
+        if indices[j] == int32(e):
+          already = true
+          break
+      if not already and logits[e] > bestVal:
+        bestVal = logits[e]
+        bestIdx = int32(e)
+    indices[k] = bestIdx
+    weights[k] = bestVal
+  # Renormalize selected weights to sum to 1
+  var topSum = 0.0'f32
+  for k in 0 ..< int(K):
+    topSum = topSum + weights[k]
+  let invTopSum = 1.0'f32 / topSum
+  for k in 0 ..< int(K):
+    weights[k] = weights[k] * invTopSum
+
+proc gpuMoeTopK*(expertIndices, expertWeights, logits: pointer,
+                  nExperts, K: int, stream: HippoStream) =
+  let grid = newDim3(1'u32)
+  let blk = newDim3(1'u32)
+  var lPtr = logits; var iPtr = expertIndices; var wPtr = expertWeights
+  var ne = nExperts.cint; var k = K.cint
+  hippoLaunchKernel(moeTopKKernel, gridDim = grid, blockDim = blk,
+                    stream = stream, args = hippoArgs(lPtr, iPtr, wPtr, ne, k))
+
+proc zeroBufferKernel(data: ptr float32, n: cint) {.hippoGlobal.} =
+  let idx = int(blockIdx.x * blockDim.x + threadIdx.x)
+  if idx < int(n):
+    cast[ptr UncheckedArray[float32]](data)[idx] = 0.0'f32
+
+proc gpuZeroBuffer*(dst: pointer, nElems: int, stream: HippoStream) =
+  let grid = newDim3(((nElems + HippoBlockSize - 1) div HippoBlockSize).uint32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var dPtr = dst; var n = nElems.cint
+  hippoLaunchKernel(zeroBufferKernel, gridDim = grid, blockDim = blk,
+                    stream = stream, args = hippoArgs(dPtr, n))
+
+# ---------------------------------------------------------------------------
+# De-interleave Q+Gate from fused projection
+# Input: [Q0(headDim), G0(headDim), Q1(headDim), G1(headDim), ...]
+# Output: q[nHead*headDim], gate[nHead*headDim]
+# ---------------------------------------------------------------------------
+proc deinterleaveQGateKernel(qOut, gateOut, fused: ptr float32,
+                              nHead, headDim: cint) {.hippoGlobal.} =
+  let idx = int(blockIdx.x * blockDim.x + threadIdx.x)
+  let total = int(nHead) * int(headDim)
+  if idx >= total: return
+  let q = cast[ptr UncheckedArray[float32]](qOut)
+  let g = cast[ptr UncheckedArray[float32]](gateOut)
+  let f = cast[ptr UncheckedArray[float32]](fused)
+  let h = idx div int(headDim)
+  let d = idx mod int(headDim)
+  q[idx] = f[h * int(headDim) * 2 + d]
+  g[idx] = f[h * int(headDim) * 2 + int(headDim) + d]
+
+proc gpuDeinterleaveQGate*(q, gate, fused: pointer, nHead, headDim: int,
+                            stream: HippoStream) =
+  let total = nHead * headDim
+  let grid = newDim3(((total + HippoBlockSize - 1) div HippoBlockSize).uint32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var qPtr = q; var gPtr = gate; var fPtr = fused
+  var nh = nHead.cint; var hd = headDim.cint
+  hippoLaunchKernel(deinterleaveQGateKernel, gridDim = grid, blockDim = blk,
+                    stream = stream, args = hippoArgs(qPtr, gPtr, fPtr, nh, hd))
+
+proc deinterleaveQGatePrefillKernel(qOut, gateOut, fused: ptr float32,
+                                     nHead, headDim, seqLen: cint) {.hippoGlobal.} =
+  let idx = int(blockIdx.x * blockDim.x + threadIdx.x)
+  let qDim = int(nHead) * int(headDim)
+  let total = qDim * int(seqLen)
+  if idx >= total: return
+  let q = cast[ptr UncheckedArray[float32]](qOut)
+  let g = cast[ptr UncheckedArray[float32]](gateOut)
+  let f = cast[ptr UncheckedArray[float32]](fused)
+  let elem = idx div int(seqLen)
+  let t = idx mod int(seqLen)
+  let h = elem div int(headDim)
+  let d = elem mod int(headDim)
+  let fusedRow = h * int(headDim) * 2 + d
+  let fusedGateRow = h * int(headDim) * 2 + int(headDim) + d
+  q[elem * int(seqLen) + t] = f[fusedRow * int(seqLen) + t]
+  g[elem * int(seqLen) + t] = f[fusedGateRow * int(seqLen) + t]
+
+proc gpuDeinterleaveQGatePrefill*(q, gate, fused: pointer, nHead, headDim, seqLen: int,
+                                   stream: HippoStream) =
+  let total = nHead * headDim * seqLen
+  let grid = newDim3(((total + HippoBlockSize - 1) div HippoBlockSize).uint32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var qPtr = q; var gPtr = gate; var fPtr = fused
+  var nh = nHead.cint; var hd = headDim.cint; var sl = seqLen.cint
+  hippoLaunchKernel(deinterleaveQGatePrefillKernel, gridDim = grid, blockDim = blk,
+                    stream = stream, args = hippoArgs(qPtr, gPtr, fPtr, nh, hd, sl))
+
+# ---------------------------------------------------------------------------
+# L2 Norm per head (for Delta Net Q, K normalization)
+# ---------------------------------------------------------------------------
+proc l2NormPerHeadKernel(data: ptr float32, nHeads, headDim: cint) {.hippoGlobal.} =
+  var sdata {.hippoShared.}: array[HippoBlockSize, float32]
+  let h = int(blockIdx.x)
+  let tid = int(threadIdx.x)
+  if h >= int(nHeads): return
+  let d = cast[ptr UncheckedArray[float32]](data)
+  let base = h * int(headDim)
+  var sumSq = 0.0'f32
+  var i = tid
+  while i < int(headDim):
+    let v = d[base + i]
+    sumSq = sumSq + v * v
+    i = i + int(blockDim.x)
+  sdata[tid] = sumSq
+  hippoSyncthreads()
+  reduceSum256(sdata, tid)
+  let invNorm = 1.0'f32 / sqrtf(sdata[0] + 1e-6'f32)
+  i = tid
+  while i < int(headDim):
+    d[base + i] = d[base + i] * invNorm
+    i = i + int(blockDim.x)
+
+proc gpuL2NormPerHead*(data: pointer, nHeads, headDim: int, stream: HippoStream) =
+  let grid = newDim3(nHeads.uint32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var dPtr = data; var nh = nHeads.cint; var hd = headDim.cint
+  hippoLaunchKernel(l2NormPerHeadKernel, gridDim = grid, blockDim = blk,
+                    stream = stream, args = hippoArgs(dPtr, nh, hd))
+
+# ---------------------------------------------------------------------------
+# Delta Net single-step recurrence (Gated Delta Net for Qwen3.6 SSM)
+# ---------------------------------------------------------------------------
+proc deltaNetDecodeKernel(
+  stateData: ptr float32,    # [nVHeads, headKDim, headVDim] recurrent state
+  qData: ptr float32,        # [nVHeads, headKDim] after L2 norm + head expansion
+  kData: ptr float32,        # [nVHeads, headKDim]
+  vData: ptr float32,        # [nVHeads, headVDim]
+  gateData: ptr float32,     # [nVHeads] decay gate (negative → decay < 1)
+  betaData: ptr float32,     # [nVHeads] damping (sigmoid output)
+  outputData: ptr float32,   # [nVHeads, headVDim] output
+  nVHeads, headKDim, headVDim: cint,
+  qScale: float32
+) {.hippoGlobal.} =
+  # One block per head
+  let h = int(blockIdx.x)
+  let tid = int(threadIdx.x)
+  if h >= int(nVHeads): return
+  let S = cast[ptr UncheckedArray[float32]](stateData)
+  let q = cast[ptr UncheckedArray[float32]](qData)
+  let k = cast[ptr UncheckedArray[float32]](kData)
+  let v = cast[ptr UncheckedArray[float32]](vData)
+  let gate = cast[ptr UncheckedArray[float32]](gateData)
+  let beta = cast[ptr UncheckedArray[float32]](betaData)
+  let o = cast[ptr UncheckedArray[float32]](outputData)
+  let kd = int(headKDim)
+  let vd = int(headVDim)
+  let stateBase = h * kd * vd
+  let decay = expf(gate[h])
+  let b = beta[h]
+  # Delta Rule recurrence (per vIdx, parallelized across threads):
+  # 1. Decay: S *= decay
+  # 2. Retrieve: kvMem = sum_k S[k,v] * K[k]
+  # 3. Delta: delta = beta * (V[v] - kvMem)
+  # 4. Write: S[k,v] += K[k] * delta
+  # 5. Read: output[v] = sum_k Q[k] * S[k,v]
+  var vIdx = tid
+  while vIdx < vd:
+    let vVal = v[h * vd + vIdx]
+    var kvMem = 0.0'f32
+    for kIdx in 0 ..< kd:
+      let sIdx = stateBase + kIdx * vd + vIdx
+      let decayed = decay * S[sIdx]
+      S[sIdx] = decayed
+      kvMem = kvMem + decayed * k[h * kd + kIdx]
+    let delta = b * (vVal - kvMem)
+    var outVal = 0.0'f32
+    for kIdx in 0 ..< kd:
+      let sIdx = stateBase + kIdx * vd + vIdx
+      let newS = S[sIdx] + k[h * kd + kIdx] * delta
+      S[sIdx] = newS
+      outVal = outVal + q[h * kd + kIdx] * newS
+    o[h * vd + vIdx] = qScale * outVal
+    vIdx = vIdx + int(blockDim.x)
+
+proc gpuDeltaNetDecode*(state, q, k, v, gate, beta, output: pointer,
+                         nVHeads, headKDim, headVDim: int,
+                         stream: HippoStream) =
+  let qScale = 1.0'f32 / sqrtf(float32(headKDim))
+  let grid = newDim3(nVHeads.uint32)
+  let blk = newDim3(min(headVDim, HippoBlockSize).uint32)
+  var sPtr = state; var qPtr = q; var kPtr = k; var vPtr = v
+  var gPtr = gate; var bPtr = beta; var oPtr = output
+  var nvh = nVHeads.cint; var hkd = headKDim.cint; var hvd = headVDim.cint
+  var qs = qScale
+  hippoLaunchKernel(deltaNetDecodeKernel, gridDim = grid, blockDim = blk,
+                    stream = stream,
+                    args = hippoArgs(sPtr, qPtr, kPtr, vPtr, gPtr, bPtr, oPtr, nvh, hkd, hvd, qs))
+
+# ---------------------------------------------------------------------------
+# Expand K heads to V heads (repeat interleave for GDN)
+# ---------------------------------------------------------------------------
+proc expandHeadsKernel(dst, src: ptr float32,
+                        nKHeads, nVHeads, headDim: cint) {.hippoGlobal.} =
+  let idx = int(blockIdx.x * blockDim.x + threadIdx.x)
+  let total = int(nVHeads) * int(headDim)
+  if idx >= total: return
+  let d = cast[ptr UncheckedArray[float32]](dst)
+  let s = cast[ptr UncheckedArray[float32]](src)
+  let vHead = idx div int(headDim)
+  let dim = idx mod int(headDim)
+  let kHead = vHead mod int(nKHeads)
+  d[idx] = s[kHead * int(headDim) + dim]
+
+proc gpuExpandHeads*(dst, src: pointer, nKHeads, nVHeads, headDim: int,
+                      stream: HippoStream) =
+  let total = nVHeads * headDim
+  let grid = newDim3(((total + HippoBlockSize - 1) div HippoBlockSize).uint32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var dPtr = dst; var sPtr = src
+  var nk = nKHeads.cint; var nv = nVHeads.cint; var hd = headDim.cint
+  hippoLaunchKernel(expandHeadsKernel, gridDim = grid, blockDim = blk,
+                    stream = stream, args = hippoArgs(dPtr, sPtr, nk, nv, hd))
+
+# ---------------------------------------------------------------------------
+# Compute Delta Net gate: gate[h] = softplus(alpha[h] + dt_bias[h]) * A[h]
+# and beta: beta[h] = sigmoid(beta_raw[h])
+# ---------------------------------------------------------------------------
+proc deltaNetGateKernel(gateOut, betaOut: ptr float32,
+                         alphaData, dtBiasData, aData, betaRawData: ptr float32,
+                         nHeads: cint) {.hippoGlobal.} =
+  let h = int(blockIdx.x * blockDim.x + threadIdx.x)
+  if h >= int(nHeads): return
+  let g = cast[ptr UncheckedArray[float32]](gateOut)
+  let bo = cast[ptr UncheckedArray[float32]](betaOut)
+  let alpha = cast[ptr UncheckedArray[float32]](alphaData)
+  let dtBias = cast[ptr UncheckedArray[float32]](dtBiasData)
+  let a = cast[ptr UncheckedArray[float32]](aData)
+  let betaRaw = cast[ptr UncheckedArray[float32]](betaRawData)
+  let x = alpha[h] + dtBias[h]
+  let sp = if x > 20.0'f32: x else: logf(1.0'f32 + expf(x))
+  g[h] = a[h] * sp
+  bo[h] = 1.0'f32 / (1.0'f32 + expf(-betaRaw[h]))
+
+proc gpuDeltaNetGate*(gateOut, betaOut, alpha, dtBias, a, betaRaw: pointer,
+                       nHeads: int, stream: HippoStream) =
+  let grid = newDim3(((nHeads + HippoBlockSize - 1) div HippoBlockSize).uint32)
+  let blk = newDim3(min(nHeads, HippoBlockSize).uint32)
+  var goPtr = gateOut; var boPtr = betaOut; var alPtr = alpha
+  var dtPtr = dtBias; var aPtr = a; var brPtr = betaRaw
+  var nh = nHeads.cint
+  hippoLaunchKernel(deltaNetGateKernel, gridDim = grid, blockDim = blk,
+                    stream = stream,
+                    args = hippoArgs(goPtr, boPtr, alPtr, dtPtr, aPtr, brPtr, nh))
+
+# ---------------------------------------------------------------------------
+# Gated RMS norm with SiLU: out[i] = rms_norm(x[i]) * silu(z[i])
+# Per head: normalize each headVDim slice, then multiply by silu(z)
+# ---------------------------------------------------------------------------
+proc gatedRmsNormKernel(outData, xData, zData, normW: ptr float32,
+                         nHeads, headDim: cint, eps: float32) {.hippoGlobal.} =
+  var sdata {.hippoShared.}: array[HippoBlockSize, float32]
+  let h = int(blockIdx.x)
+  let tid = int(threadIdx.x)
+  if h >= int(nHeads): return
+  let o = cast[ptr UncheckedArray[float32]](outData)
+  let x = cast[ptr UncheckedArray[float32]](xData)
+  let z = cast[ptr UncheckedArray[float32]](zData)
+  let w = cast[ptr UncheckedArray[float32]](normW)
+  let base = h * int(headDim)
+  var sumSq = 0.0'f32
+  var i = tid
+  while i < int(headDim):
+    let v = x[base + i]
+    sumSq = sumSq + v * v
+    i = i + int(blockDim.x)
+  sdata[tid] = sumSq
+  hippoSyncthreads()
+  reduceSum256(sdata, tid)
+  let rms = 1.0'f32 / sqrtf(sdata[0] / float32(headDim) + eps)
+  i = tid
+  while i < int(headDim):
+    let zVal = z[base + i]
+    let siluZ = zVal / (1.0'f32 + expf(-zVal))
+    o[base + i] = x[base + i] * rms * w[i] * siluZ
+    i = i + int(blockDim.x)
+
+proc gpuGatedRmsNorm*(output, x, z, normWeight: pointer,
+                       nHeads, headDim: int, eps: float32,
+                       stream: HippoStream) =
+  let grid = newDim3(nHeads.uint32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var oPtr = output; var xPtr = x; var zPtr = z; var wPtr = normWeight
+  var nh = nHeads.cint; var hd = headDim.cint; var e = eps
+  hippoLaunchKernel(gatedRmsNormKernel, gridDim = grid, blockDim = blk,
+                    stream = stream,
+                    args = hippoArgs(oPtr, xPtr, zPtr, wPtr, nh, hd, e))
+
+# ---------------------------------------------------------------------------
 # Group RMSNorm kernel (for SSM output)
 # ---------------------------------------------------------------------------
 proc groupRmsNormKernel(
@@ -2099,7 +2496,7 @@ proc conv1dDecodeKernel2(
   let base = ch * convLen
   # Compute conv output: weight layout [nChannels, kernelSize] (GGUF ne[0]=kernelSize)
   let wBase = ch * int(kernelSize)
-  var acc = b[ch]
+  var acc = if biasData != nil: b[ch] else: 0.0'f32
   for i in 0 ..< convLen:
     acc = acc + cs[base + i] * w[wBase + i]
   acc = acc + inp[ch] * w[wBase + convLen]
@@ -2412,8 +2809,8 @@ proc ropeAtPosKernel(
   let c = cosf(angle)
   let s = sinf(angle)
   if int(seqLen) == 1:
-    let idx0 = hOffset + 2 * i
-    let idx1 = hOffset + 2 * i + 1
+    let idx0 = hOffset + i
+    let idx1 = hOffset + halfRope + i
     let v0 = x[idx0]
     let v1 = x[idx1]
     x[idx0] = v0 * c - v1 * s
@@ -2421,8 +2818,8 @@ proc ropeAtPosKernel(
   else:
     var p = 0
     while p < int(seqLen):
-      let idx0 = (hOffset + 2 * i) * int(seqLen) + p
-      let idx1 = (hOffset + 2 * i + 1) * int(seqLen) + p
+      let idx0 = (hOffset + i) * int(seqLen) + p
+      let idx1 = (hOffset + halfRope + i) * int(seqLen) + p
       let pTheta = powf(1.0'f32 / cfloat(ropeBase), cfloat(2 * i) / cfloat(ropeDim))
       let pAngle = cfloat(p) * pTheta
       let pc = cosf(pAngle)
@@ -2455,8 +2852,8 @@ proc ropeQKDecodeKernel(
   let angle = cfloat(pos) * thetaArr[i]
   let c = cosf(angle)
   let s = sinf(angle)
-  let idx0 = hOffset + 2'i32 * i
-  let idx1 = hOffset + 2'i32 * i + 1'i32
+  let idx0 = hOffset + i
+  let idx1 = hOffset + halfRope + i
   let v0 = x[idx0]
   let v1 = x[idx1]
   x[idx0] = v0 * c - v1 * s
@@ -2490,6 +2887,49 @@ proc gpuRopeAtPos*(x: pointer, nHead, headDim, ropeDim: int,
                     args = hippoArgs(xPtr, nHeadArg, headDimArg, ropeDimArg,
                                      ropeBaseArg, posArg, seqLenArg))
 
+proc ropeAtPosThetaKernel(
+  xData, thetaData: ptr float32,
+  nHead, headDim, halfRope: cint,
+  pos: cint, seqLen: cint
+) {.hippoGlobal.} =
+  let idx = int(blockIdx.x * blockDim.x + threadIdx.x)
+  let totalPairs = int(nHead) * int(halfRope)
+  if idx >= totalPairs: return
+  let x = cast[ptr UncheckedArray[float32]](xData)
+  let th = cast[ptr UncheckedArray[float32]](thetaData)
+  let h = idx div int(halfRope)
+  let i = idx mod int(halfRope)
+  let hOffset = h * int(headDim)
+  if int(seqLen) == 1:
+    let angle = cfloat(pos) * th[i]
+    let c = cosf(angle); let s = sinf(angle)
+    let idx0 = hOffset + i; let idx1 = hOffset + int(halfRope) + i
+    let v0 = x[idx0]; let v1 = x[idx1]
+    x[idx0] = v0 * c - v1 * s; x[idx1] = v0 * s + v1 * c
+  else:
+    var p = 0
+    while p < int(seqLen):
+      let angle = cfloat(pos + p) * th[i]
+      let c = cosf(angle); let s = sinf(angle)
+      let idx0 = (hOffset + i) * int(seqLen) + p
+      let idx1 = (hOffset + int(halfRope) + i) * int(seqLen) + p
+      let v0 = x[idx0]; let v1 = x[idx1]
+      x[idx0] = v0 * c - v1 * s; x[idx1] = v0 * s + v1 * c
+      p = p + 1
+
+proc gpuRopeAtPosTheta*(x: pointer, nHead, headDim, ropeDim: int,
+                          pos, seqLen: int, stream: HippoStream) =
+  let halfRope = ropeDim div 2
+  let totalPairs = nHead * halfRope
+  let grid = newDim3(((totalPairs + HippoBlockSize - 1) div HippoBlockSize).uint32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var xPtr = x; var thetaPtr = modelPtrs.ropeTheta
+  var nH = nHead.cint; var hd = headDim.cint; var hr = halfRope.cint
+  var posArg = pos.cint; var slArg = seqLen.cint
+  hippoLaunchKernel(ropeAtPosThetaKernel, gridDim = grid, blockDim = blk,
+                    stream = stream,
+                    args = hippoArgs(xPtr, thetaPtr, nH, hd, hr, posArg, slArg))
+
 # ---------------------------------------------------------------------------
 # Fused RoPE + KV store kernel
 # ---------------------------------------------------------------------------
@@ -2520,8 +2960,8 @@ proc fusedRopeStoreKVKernel(
     let angle = cfloat(pos) * thetaArr[i]
     let c = cosf(angle)
     let s = sinf(angle)
-    let idx0 = hOffset + 2'i32 * i
-    let idx1 = hOffset + 2'i32 * i + 1'i32
+    let idx0 = hOffset + i
+    let idx1 = hOffset + halfRope + i
     let v0 = x[idx0]
     let v1 = x[idx1]
     x[idx0] = v0 * c - v1 * s
@@ -2916,9 +3356,16 @@ proc initGpuKvCache*(nLayer, nHeadKv, headDim, maxLen: int,
 proc initGpuSsmState*(hp: HParams, nLayer: int): SsmGpuState =
   ensureGpuContext()
   if hp.ssmInnerSize <= 0: return
-  let nHeads = hp.ssmDtRank
-  let headDim = hp.ssmInnerSize div nHeads
-  let convDim = hp.ssmInnerSize + 2 * hp.ssmGroupCount * hp.ssmStateSize
+  let isQwen35Moe = hp.arch == "qwen35moe"
+  let nVHeads = hp.ssmDtRank
+  let headVDim = hp.ssmInnerSize div nVHeads
+  # convDim: channels for 1D convolution
+  # Nemotron-H Mamba2: ssmInnerSize + 2 * nGroups * stateSize
+  # Qwen3.6 Delta Net: 2 * nKHeads * stateSize + ssmInnerSize (Q + K + V)
+  let convDim = if isQwen35Moe:
+    2 * hp.ssmGroupCount * hp.ssmStateSize + hp.ssmInnerSize
+  else:
+    hp.ssmInnerSize + 2 * hp.ssmGroupCount * hp.ssmStateSize
   let convLen = hp.ssmConvKernel - 1
   result.ssmLayerMap = newSeq[int](nLayer)
   var ssmIdx = 0
@@ -2927,15 +3374,18 @@ proc initGpuSsmState*(hp: HParams, nLayer: int): SsmGpuState =
   result.convState = newSeq[GpuTensor](0)
   result.recState = newSeq[GpuTensor](0)
   for i in 0 ..< nLayer:
-    let hasSsm = hp.layerNHeadKv.len > i and hp.layerNHeadKv[i] == 0 and
-                 hp.layerNFfn.len > i and hp.layerNFfn[i] == 0
+    let hasSsm = if isQwen35Moe:
+      hp.fullAttnInterval > 0 and (i mod hp.fullAttnInterval) != (hp.fullAttnInterval - 1)
+    else:
+      hp.layerNHeadKv.len > i and hp.layerNHeadKv[i] == 0 and
+      hp.layerNFfn.len > i and hp.layerNFfn[i] == 0
     if hasSsm:
       result.ssmLayerMap[i] = ssmIdx
       let cs = newGpuTensor(@[convDim, convLen])
       var csZeros = newSeq[byte](cs.sizeBytes)
       hippoMemcpy(cs.devicePtr, addr csZeros[0], cs.sizeBytes, HippoMemcpyHostToDevice)
       result.convState.add(cs)
-      let rs = newGpuTensor(@[nHeads * hp.ssmStateSize * headDim])
+      let rs = newGpuTensor(@[nVHeads * hp.ssmStateSize * headVDim])
       var rsZeros = newSeq[byte](rs.sizeBytes)
       hippoMemcpy(rs.devicePtr, addr rsZeros[0], rs.sizeBytes, HippoMemcpyHostToDevice)
       result.recState.add(rs)
@@ -2983,7 +3433,12 @@ proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
         qtypeField = 0
 
     # Classify layer
-    if m.infos.hasKey(lp & "ssm_in.weight"):
+    if hp.arch == "qwen35moe":
+      if m.infos.hasKey(lp & "ssm_out.weight"):
+        lw.kind = lkSsmAttnMoe
+      else:
+        lw.kind = lkAttnMoe
+    elif m.infos.hasKey(lp & "ssm_in.weight"):
       lw.kind = lkSsm
     elif hp.layerNHeadKv.len > layer and hp.layerNHeadKv[layer] > 0:
       if m.infos.hasKey(lp & "ffn_gate.weight") or m.infos.hasKey(lp & "ffn_up.weight"):
@@ -3036,6 +3491,82 @@ proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
       lw.ssmA = loadF32Ptr(lp & "ssm_a")
       lw.ssmD = loadF32Ptr(lp & "ssm_d")
       lw.ssmNorm = loadF32Ptr(lp & "ssm_norm.weight")
+
+    of lkAttnMoe:
+      lw.postAttnNorm = loadF32Ptr(lp & "post_attention_norm.weight")
+      uploadWeight(lw.wq, lw.wqQ, lw.wqQType, "attn_q.weight")
+      uploadWeight(lw.wk, lw.wkQ, lw.wkQType, "attn_k.weight")
+      uploadWeight(lw.wv, lw.wvQ, lw.wvQType, "attn_v.weight")
+      uploadWeight(lw.wo, lw.woQ, lw.woQType, "attn_output.weight")
+      lw.wColsQ = hp.nEmb
+      if m.infos.hasKey(lp & "attn_q_norm.weight"):
+        lw.attnQNorm = loadF32Ptr(lp & "attn_q_norm.weight")
+      if m.infos.hasKey(lp & "attn_k_norm.weight"):
+        lw.attnKNorm = loadF32Ptr(lp & "attn_k_norm.weight")
+      # MoE weights
+      lw.moeRouterW = loadF32Ptr(lp & "ffn_gate_inp.weight")
+      block:
+        let gtn = lp & "ffn_gate_exps.weight"
+        let gInfo = m.infos[gtn]
+        lw.moeGateExpsQ = cachedQuantWeight(gtn, m, gtn).devicePtr
+        lw.moeGateExpsQType = gInfo.elemType
+        lw.moeGateExpsSliceBytes = quantRowSize(int(gInfo.ne[0]), gInfo.elemType) * int(gInfo.ne[1])
+        let utn = lp & "ffn_up_exps.weight"
+        let uInfo = m.infos[utn]
+        lw.moeUpExpsQ = cachedQuantWeight(utn, m, utn).devicePtr
+        lw.moeUpExpsQType = uInfo.elemType
+        lw.moeUpExpsSliceBytes = quantRowSize(int(uInfo.ne[0]), uInfo.elemType) * int(uInfo.ne[1])
+        let dtn = lp & "ffn_down_exps.weight"
+        let dInfo = m.infos[dtn]
+        lw.moeDownExpsQ = cachedQuantWeight(dtn, m, dtn).devicePtr
+        lw.moeDownExpsQType = dInfo.elemType
+        lw.moeDownExpsSliceBytes = quantRowSize(int(dInfo.ne[0]), dInfo.elemType) * int(dInfo.ne[1])
+      # Shared expert
+      uploadWeight(lw.wGate, lw.moeShGateQ, lw.moeShGateQType, "ffn_gate_shexp.weight")
+      uploadWeight(lw.wUp, lw.moeShUpQ, lw.moeShUpQType, "ffn_up_shexp.weight")
+      uploadWeight(lw.wDown, lw.moeShDownQ, lw.moeShDownQType, "ffn_down_shexp.weight")
+      lw.moeShGateScalar = loadF32Ptr(lp & "ffn_gate_inp_shexp.weight")
+
+    of lkSsmAttnMoe:
+      lw.postAttnNorm = loadF32Ptr(lp & "post_attention_norm.weight")
+      # Delta Net QKV projection: nEmb → convDim (8192)
+      uploadWeight(lw.wq, lw.wqkvQ, lw.wqkvQType, "attn_qkv.weight")
+      # Gate projection: nEmb → ssmInnerSize (4096)
+      uploadWeight(lw.wo, lw.ssmGateQ, lw.ssmGateQType, "attn_gate.weight")
+      lw.wColsQ = hp.nEmb
+      # SSM recurrence parameters
+      uploadWeight(lw.wk, lw.ssmAlphaQ, lw.ssmAlphaQType, "ssm_alpha.weight")
+      uploadWeight(lw.wv, lw.ssmBetaQ, lw.ssmBetaQType, "ssm_beta.weight")
+      lw.ssmConv1dW = loadF32Ptr(lp & "ssm_conv1d.weight")
+      if m.infos.hasKey(lp & "ssm_conv1d.bias"):
+        lw.ssmConv1dBias = loadF32Ptr(lp & "ssm_conv1d.bias")
+      lw.ssmDtBias = loadF32Ptr(lp & "ssm_dt.bias")
+      lw.ssmA = loadF32Ptr(lp & "ssm_a")
+      lw.ssmNorm = loadF32Ptr(lp & "ssm_norm.weight")
+      # Output projection: ssmInnerSize → nEmb
+      uploadWeight(lw.wGate, lw.ssmOutQ, lw.ssmOutQType, "ssm_out.weight")
+      # MoE weights (same as lkAttnMoe)
+      lw.moeRouterW = loadF32Ptr(lp & "ffn_gate_inp.weight")
+      block:
+        let gtn = lp & "ffn_gate_exps.weight"
+        let gInfo = m.infos[gtn]
+        lw.moeGateExpsQ = cachedQuantWeight(gtn, m, gtn).devicePtr
+        lw.moeGateExpsQType = gInfo.elemType
+        lw.moeGateExpsSliceBytes = quantRowSize(int(gInfo.ne[0]), gInfo.elemType) * int(gInfo.ne[1])
+        let utn = lp & "ffn_up_exps.weight"
+        let uInfo = m.infos[utn]
+        lw.moeUpExpsQ = cachedQuantWeight(utn, m, utn).devicePtr
+        lw.moeUpExpsQType = uInfo.elemType
+        lw.moeUpExpsSliceBytes = quantRowSize(int(uInfo.ne[0]), uInfo.elemType) * int(uInfo.ne[1])
+        let dtn = lp & "ffn_down_exps.weight"
+        let dInfo = m.infos[dtn]
+        lw.moeDownExpsQ = cachedQuantWeight(dtn, m, dtn).devicePtr
+        lw.moeDownExpsQType = dInfo.elemType
+        lw.moeDownExpsSliceBytes = quantRowSize(int(dInfo.ne[0]), dInfo.elemType) * int(dInfo.ne[1])
+      uploadWeight(lw.wGate, lw.moeShGateQ, lw.moeShGateQType, "ffn_gate_shexp.weight")
+      uploadWeight(lw.wUp, lw.moeShUpQ, lw.moeShUpQType, "ffn_up_shexp.weight")
+      uploadWeight(lw.wDown, lw.moeShDownQ, lw.moeShDownQType, "ffn_down_shexp.weight")
+      lw.moeShGateScalar = loadF32Ptr(lp & "ffn_gate_inp_shexp.weight")
 
     modelPtrs.layers[layer] = lw
 
@@ -3194,7 +3725,7 @@ proc unloadModelBackend*() =
 # ---------------------------------------------------------------------------
 proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tensor =
   let hp = m.hparams
-  if hp.arch != "" and hp.arch notin ["llama", "qwen3", "nemotron_h"]:
+  if hp.arch != "" and hp.arch notin ["llama", "qwen3", "nemotron_h", "qwen35moe"]:
     raise newException(ValueError, "unsupported architecture: " & hp.arch)
   if hp.nHeadKv != 0 and hp.nHead > 0 and (hp.nHead mod hp.nHeadKv) != 0:
     raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
@@ -3217,6 +3748,9 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
   maxRows = max(maxRows, ssmProjDim)
   for i in 0 ..< hp.layerNFfn.len:
     maxRows = max(maxRows, hp.layerNFfn[i])
+  if hp.nExperts > 0:
+    maxRows = max(maxRows, hp.nExperts)
+    maxRows = max(maxRows, qDim + 2 * kvDim)
   ensureActivationBuffers(maxRows * seqLen)
   ensureScratchBuffers(maxRows * seqLen)
   let stream = gpuCtx.stream
@@ -3232,6 +3766,7 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
   let tmp0 = gpuCtx.scratch0.devicePtr
   let tmp1 = gpuCtx.scratch1.devicePtr
   let tmp2 = gpuCtx.scratch2.devicePtr
+  let tmp3 = gpuCtx.scratch3.devicePtr
 
   gpuEmbedding(xPtr, dTokEmb.devicePtr, cast[ptr int32](tokenPtr),
                hp.nEmb, seqLen, hp.nVocab, stream)
@@ -3246,6 +3781,32 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
     let lp = "blk." & $layer & "."
     let lw = modelPtrs.layers[layer]
     let dAttnNorm = loadF32Weight(lp & "attn_norm.weight")
+
+    when defined(traceNormWeights):
+      if layer <= 3:
+        block:
+          var buf = newSeq[float32](hp.nEmb)
+          gpuDownloadFromDevice(addr buf[0], dAttnNorm.devicePtr, hp.nEmb * sizeof(float32), stream)
+          gpuStreamSync(stream)
+          echo &"  L{layer} attn_norm first5={buf[0..4]}"
+
+    when defined(traceGdn):
+      block:
+        let totalElems = hp.nEmb * seqLen
+        var xBuf = newSeq[float32](totalElems)
+        gpuDownloadFromDevice(addr xBuf[0], xPtr, totalElems * sizeof(float32), stream)
+        gpuStreamSync(stream)
+        let lastCol = seqLen - 1
+        var ss = 0.0'f64
+        var nNan, nInf = 0
+        for ii in 0 ..< hp.nEmb:
+          let v = xBuf[ii * seqLen + lastCol]
+          if v != v: inc nNan
+          elif v == Inf or v == -Inf: inc nInf
+          else: ss += float64(v) * float64(v)
+        echo "Layer ", layer, " (", lw.kind, ") x_rms=",
+          formatFloat(math.sqrt(ss / float64(hp.nEmb)), ffDecimal, 6),
+          " nan=", nNan, " inf=", nInf
 
     case lw.kind
     of lkAttentionFfn:
@@ -3364,6 +3925,364 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
         gpuScatterAddCol(xPtr, tmp0, hp.nEmb, seqLen, t, stream)
       continue  # skip the gpuAdd below since we scattered per-token
 
+    of lkAttnMoe:
+      gpuRmsnormCols(xNormPtr, xPtr, dAttnNorm.devicePtr, hp.nEmb, seqLen, hp.rmsEps, stream)
+      let dWq = loadF32Weight(lp & "attn_q.weight")
+      let dWk = loadF32Weight(lp & "attn_k.weight")
+      let dWv = loadF32Weight(lp & "attn_v.weight")
+      let dWo = loadF32Weight(lp & "attn_output.weight")
+      # Q projection outputs Q+gate interleaved
+      let qFullDim = 2 * qDim
+      gpuLinearCol(tmp2, xNormPtr, dWq.devicePtr, hp.nEmb, qFullDim, seqLen, stream)
+      gpuDeinterleaveQGatePrefill(tmp0, tmp3, tmp2, hp.nHead, headDim, seqLen, stream)
+      gpuLinearCol(tmp1, xNormPtr, dWk.devicePtr, hp.nEmb, kvDim, seqLen, stream)
+      gpuLinearCol(tmp2, xNormPtr, dWv.devicePtr, hp.nEmb, kvDim, seqLen, stream)
+      if m.infos.hasKey(lp & "attn_q_norm.weight"):
+        let dQNorm = loadF32Weight(lp & "attn_q_norm.weight")
+        gpuQkNormPrefill(tmp0, dQNorm.devicePtr, hp.nHead, headDim, seqLen, hp.rmsEps, stream)
+      if m.infos.hasKey(lp & "attn_k_norm.weight"):
+        let dKNorm = loadF32Weight(lp & "attn_k_norm.weight")
+        gpuQkNormPrefill(tmp1, dKNorm.devicePtr, hp.nHeadKv, headDim, seqLen, hp.rmsEps, stream)
+      gpuRopeAtPosTheta(tmp0, hp.nHead, headDim, ropeDim, 0, seqLen, stream)
+      gpuRopeAtPosTheta(tmp1, hp.nHeadKv, headDim, ropeDim, 0, seqLen, stream)
+      gpuStoreKV(cache.gpuCache.k[layer].devicePtr, tmp1, kvDim, seqLen, cache.gpuCache.maxLen, 0, stream)
+      gpuStoreKV(cache.gpuCache.v[layer].devicePtr, tmp2, kvDim, seqLen, cache.gpuCache.maxLen, 0, stream)
+      gpuAttentionPrefill(xNormPtr, tmp0, tmp1, tmp2,
+                          hp.nHead, hp.nHeadKv, headDim, seqLen, stream)
+      when defined(traceAttn):
+        if layer == 3:
+          block:
+            var buf = newSeq[float32](qDim * seqLen)
+            gpuDownloadFromDevice(addr buf[0], xNormPtr, qDim * seqLen * sizeof(float32), stream)
+            gpuStreamSync(stream)
+            var ss = 0.0'f64
+            for ii in 0 ..< qDim:
+              let v = float64(buf[ii * seqLen + seqLen - 1])
+              ss += v * v
+            echo &"  L3 attn_out rms={math.sqrt(ss / float64(qDim)):.6f}"
+            var gateBuf = newSeq[float32](qDim * seqLen)
+            gpuDownloadFromDevice(addr gateBuf[0], tmp3, qDim * seqLen * sizeof(float32), stream)
+            gpuStreamSync(stream)
+            var gss = 0.0'f64
+            var sigMin = 1.0'f64
+            var sigMax = 0.0'f64
+            for ii in 0 ..< qDim:
+              let gv = float64(gateBuf[ii * seqLen + seqLen - 1])
+              let sv = 1.0'f64 / (1.0'f64 + math.exp(-gv))
+              gss += sv * sv
+              if sv < sigMin: sigMin = sv
+              if sv > sigMax: sigMax = sv
+            echo &"  L3 gate_sigmoid rms={math.sqrt(gss / float64(qDim)):.6f} min={sigMin:.6f} max={sigMax:.6f}"
+      # Apply attention gate
+      gpuAttnGate(xNormPtr, tmp3, qDim * seqLen, stream)
+      gpuLinearCol(tmp0, xNormPtr, dWo.devicePtr, qDim, hp.nEmb, seqLen, stream)
+      when defined(traceAttn):
+        if layer == 3:
+          block:
+            var buf = newSeq[float32](hp.nEmb * seqLen)
+            gpuDownloadFromDevice(addr buf[0], tmp0, hp.nEmb * seqLen * sizeof(float32), stream)
+            gpuStreamSync(stream)
+            var ss = 0.0'f64
+            for ii in 0 ..< hp.nEmb:
+              let v = float64(buf[ii * seqLen + seqLen - 1])
+              ss += v * v
+            echo &"  L3 attn_residual rms={math.sqrt(ss / float64(hp.nEmb)):.6f}"
+      gpuAdd(xPtr, xPtr, tmp0, hp.nEmb * seqLen, stream)
+      # Post-attention norm
+      let dPostNorm = loadF32Weight(lp & "post_attention_norm.weight")
+      gpuRmsnormCols(xNormPtr, xPtr, dPostNorm.devicePtr, hp.nEmb, seqLen, hp.rmsEps, stream)
+      # MoE FFN per-token
+      for t in 0 ..< seqLen:
+        gpuGatherCol(tmp2, xNormPtr, hp.nEmb, seqLen, t, stream)
+        gpuLinearCol(tmp0, tmp2, lw.moeRouterW, hp.nEmb, hp.nExperts, 1, stream)
+        let eiPtr = tmp3
+        let ewPtr = cast[pointer](cast[uint](tmp3) + uint(hp.nExpertsUsed * sizeof(int32)))
+        gpuMoeTopK(eiPtr, ewPtr, tmp0, hp.nExperts, hp.nExpertsUsed, stream)
+        var expertIndices: array[32, int32]
+        var expertWeights: array[32, float32]
+        gpuDownloadFromDevice(addr expertIndices[0], eiPtr, hp.nExpertsUsed * sizeof(int32), stream)
+        gpuDownloadFromDevice(addr expertWeights[0], ewPtr, hp.nExpertsUsed * sizeof(float32), stream)
+        gpuStreamSync(stream)
+        gpuZeroBuffer(tmp1, hp.nEmb, stream)
+        for e in 0 ..< hp.nExpertsUsed:
+          let eidx = int(expertIndices[e])
+          let gateOff = cast[pointer](cast[uint](lw.moeGateExpsQ) + uint(eidx * lw.moeGateExpsSliceBytes))
+          gpuLinearColQuant(tmp0, tmp2, gateOff, hp.nEmb, hp.expertFfnDim, lw.moeGateExpsQType, stream)
+          let upOff = cast[pointer](cast[uint](lw.moeUpExpsQ) + uint(eidx * lw.moeUpExpsSliceBytes))
+          gpuLinearColQuant(tmp3, tmp2, upOff, hp.nEmb, hp.expertFfnDim, lw.moeUpExpsQType, stream)
+          gpuSiluMul(tmp0, tmp0, tmp3, hp.expertFfnDim, stream)
+          let downOff = cast[pointer](cast[uint](lw.moeDownExpsQ) + uint(eidx * lw.moeDownExpsSliceBytes))
+          gpuLinearColQuant(tmp3, tmp0, downOff, hp.expertFfnDim, hp.nEmb, lw.moeDownExpsQType, stream)
+          gpuScaleAdd(tmp1, tmp3, expertWeights[e], hp.nEmb, stream)
+        if lw.moeShGateQ != nil:
+          gpuLinearColQuant(tmp0, tmp2, lw.moeShGateQ, hp.nEmb, hp.expertFfnDim, lw.moeShGateQType, stream)
+        else:
+          gpuLinearCol(tmp0, tmp2, lw.wGate, hp.nEmb, hp.expertFfnDim, 1, stream)
+        if lw.moeShUpQ != nil:
+          gpuLinearColQuant(tmp3, tmp2, lw.moeShUpQ, hp.nEmb, hp.expertFfnDim, lw.moeShUpQType, stream)
+        else:
+          gpuLinearCol(tmp3, tmp2, lw.wUp, hp.nEmb, hp.expertFfnDim, 1, stream)
+        gpuSiluMul(tmp0, tmp0, tmp3, hp.expertFfnDim, stream)
+        if lw.moeShDownQ != nil:
+          gpuLinearColQuant(tmp3, tmp0, lw.moeShDownQ, hp.expertFfnDim, hp.nEmb, lw.moeShDownQType, stream)
+        else:
+          gpuLinearCol(tmp3, tmp0, lw.wDown, hp.expertFfnDim, hp.nEmb, 1, stream)
+        gpuSharedExpertGate(tmp3, tmp2, lw.moeShGateScalar, hp.nEmb, stream)
+        gpuAdd(tmp0, tmp1, tmp3, hp.nEmb, stream)
+        gpuScatterAddCol(xPtr, tmp0, hp.nEmb, seqLen, t, stream)
+      continue
+
+    of lkSsmAttnMoe:
+      let nVHeads = hp.ssmDtRank
+      let nKHeads = hp.ssmGroupCount
+      let headKDim = hp.ssmStateSize
+      let headVDim = hp.ssmInnerSize div nVHeads
+      let convDim = 2 * nKHeads * headKDim + hp.ssmInnerSize
+      let qkDim = nKHeads * headKDim
+      let ssmLayerIdx = cache.ssmState.ssmLayerMap[layer]
+      when defined(skipGdnAttn):
+        block:
+          let dPN = loadF32Weight(lp & "post_attention_norm.weight")
+          gpuRmsnormCols(xNormPtr, xPtr, dPN.devicePtr, hp.nEmb, seqLen, hp.rmsEps, stream)
+        for t in 0 ..< seqLen:
+          gpuGatherCol(tmp2, xNormPtr, hp.nEmb, seqLen, t, stream)
+          gpuLinearCol(tmp0, tmp2, lw.moeRouterW, hp.nEmb, hp.nExperts, 1, stream)
+          let eiPtr = tmp3
+          let ewPtr = cast[pointer](cast[uint](tmp3) + uint(hp.nExpertsUsed * sizeof(int32)))
+          gpuMoeTopK(eiPtr, ewPtr, tmp0, hp.nExperts, hp.nExpertsUsed, stream)
+          var expertIndices: array[32, int32]
+          var expertWeights: array[32, float32]
+          gpuDownloadFromDevice(addr expertIndices[0], eiPtr, hp.nExpertsUsed * sizeof(int32), stream)
+          gpuDownloadFromDevice(addr expertWeights[0], ewPtr, hp.nExpertsUsed * sizeof(float32), stream)
+          gpuStreamSync(stream)
+          gpuZeroBuffer(tmp1, hp.nEmb, stream)
+          for e in 0 ..< hp.nExpertsUsed:
+            let eidx = int(expertIndices[e])
+            let gateOff = cast[pointer](cast[uint](lw.moeGateExpsQ) + uint(eidx * lw.moeGateExpsSliceBytes))
+            gpuLinearColQuant(tmp0, tmp2, gateOff, hp.nEmb, hp.expertFfnDim, lw.moeGateExpsQType, stream)
+            let upOff = cast[pointer](cast[uint](lw.moeUpExpsQ) + uint(eidx * lw.moeUpExpsSliceBytes))
+            gpuLinearColQuant(tmp3, tmp2, upOff, hp.nEmb, hp.expertFfnDim, lw.moeUpExpsQType, stream)
+            gpuSiluMul(tmp0, tmp0, tmp3, hp.expertFfnDim, stream)
+            let downOff = cast[pointer](cast[uint](lw.moeDownExpsQ) + uint(eidx * lw.moeDownExpsSliceBytes))
+            gpuLinearColQuant(tmp3, tmp0, downOff, hp.expertFfnDim, hp.nEmb, lw.moeDownExpsQType, stream)
+            gpuScaleAdd(tmp1, tmp3, expertWeights[e], hp.nEmb, stream)
+          if lw.moeShGateQ != nil:
+            gpuLinearColQuant(tmp0, tmp2, lw.moeShGateQ, hp.nEmb, hp.expertFfnDim, lw.moeShGateQType, stream)
+          else:
+            gpuLinearCol(tmp0, tmp2, lw.wGate, hp.nEmb, hp.expertFfnDim, 1, stream)
+          if lw.moeShUpQ != nil:
+            gpuLinearColQuant(tmp3, tmp2, lw.moeShUpQ, hp.nEmb, hp.expertFfnDim, lw.moeShUpQType, stream)
+          else:
+            gpuLinearCol(tmp3, tmp2, lw.wUp, hp.nEmb, hp.expertFfnDim, 1, stream)
+          gpuSiluMul(tmp0, tmp0, tmp3, hp.expertFfnDim, stream)
+          if lw.moeShDownQ != nil:
+            gpuLinearColQuant(tmp3, tmp0, lw.moeShDownQ, hp.expertFfnDim, hp.nEmb, lw.moeShDownQType, stream)
+          else:
+            gpuLinearCol(tmp3, tmp0, lw.wDown, hp.expertFfnDim, hp.nEmb, 1, stream)
+          gpuSharedExpertGate(tmp3, tmp2, lw.moeShGateScalar, hp.nEmb, stream)
+          gpuAdd(tmp0, tmp1, tmp3, hp.nEmb, stream)
+          gpuScatterAddCol(xPtr, tmp0, hp.nEmb, seqLen, t, stream)
+        continue
+      gpuRmsnormCols(xNormPtr, xPtr, dAttnNorm.devicePtr, hp.nEmb, seqLen, hp.rmsEps, stream)
+      # Delta Net per-token + post_attn_norm → xPtr, then MoE per-token
+      for t in 0 ..< seqLen:
+        gpuGatherCol(tmp2, xNormPtr, hp.nEmb, seqLen, t, stream)
+        when defined(traceGdn):
+          if layer == 0 and t == seqLen - 1:
+            block:
+              var buf = newSeq[float32](hp.nEmb)
+              gpuDownloadFromDevice(addr buf[0], tmp2, hp.nEmb * sizeof(float32), stream)
+              gpuStreamSync(stream)
+              var ss = 0.0'f64
+              for ii in 0 ..< hp.nEmb:
+                ss += float64(buf[ii]) * float64(buf[ii])
+              echo "  L0 xNorm rms=", formatFloat(math.sqrt(ss / float64(hp.nEmb)), ffDecimal, 6),
+                " first5=", buf[0..4]
+        # QKV projection
+        if lw.wqkvQ != nil:
+          gpuLinearColQuant(tmp0, tmp2, lw.wqkvQ, hp.nEmb, convDim, lw.wqkvQType, stream)
+        else:
+          gpuLinearCol(tmp0, tmp2, lw.wq, hp.nEmb, convDim, 1, stream)
+        when defined(traceGdn):
+          if layer == 0 and t == seqLen - 1:
+            block:
+              var buf = newSeq[float32](convDim)
+              gpuDownloadFromDevice(addr buf[0], tmp0, convDim * sizeof(float32), stream)
+              gpuStreamSync(stream)
+              var ss = 0.0'f64
+              for ii in 0 ..< convDim:
+                ss += float64(buf[ii]) * float64(buf[ii])
+              echo "  L0 qkv_proj rms=", formatFloat(math.sqrt(ss / float64(convDim)), ffDecimal, 6),
+                " first5=", buf[0..4]
+        # Gate (z) projection → tmp1
+        if lw.ssmGateQ != nil:
+          gpuLinearColQuant(tmp1, tmp2, lw.ssmGateQ, hp.nEmb, hp.ssmInnerSize, lw.ssmGateQType, stream)
+        else:
+          gpuLinearCol(tmp1, tmp2, lw.wo, hp.nEmb, hp.ssmInnerSize, 1, stream)
+        # Alpha/beta
+        let alphaPtr = tmp3
+        let betaRawPtr = cast[pointer](cast[uint](tmp3) + uint(nVHeads * sizeof(float32)))
+        if lw.ssmAlphaQ != nil:
+          gpuLinearColQuant(alphaPtr, tmp2, lw.ssmAlphaQ, hp.nEmb, nVHeads, lw.ssmAlphaQType, stream)
+        else:
+          gpuLinearCol(alphaPtr, tmp2, lw.wk, hp.nEmb, nVHeads, 1, stream)
+        if lw.ssmBetaQ != nil:
+          gpuLinearColQuant(betaRawPtr, tmp2, lw.ssmBetaQ, hp.nEmb, nVHeads, lw.ssmBetaQType, stream)
+        else:
+          gpuLinearCol(betaRawPtr, tmp2, lw.wv, hp.nEmb, nVHeads, 1, stream)
+        let gateDecayPtr = cast[pointer](cast[uint](tmp3) + uint(2 * nVHeads * sizeof(float32)))
+        let betaSigPtr = cast[pointer](cast[uint](tmp3) + uint(3 * nVHeads * sizeof(float32)))
+        gpuDeltaNetGate(gateDecayPtr, betaSigPtr, alphaPtr, lw.ssmDtBias, lw.ssmA, betaRawPtr,
+                         nVHeads, stream)
+        when defined(traceGdn):
+          if layer == 0 and t == seqLen - 1:
+            block:
+              var abuf = newSeq[float32](nVHeads)
+              var bbuf = newSeq[float32](nVHeads)
+              var gbuf = newSeq[float32](nVHeads)
+              var bsbuf = newSeq[float32](nVHeads)
+              gpuDownloadFromDevice(addr abuf[0], alphaPtr, nVHeads * sizeof(float32), stream)
+              gpuDownloadFromDevice(addr bbuf[0], betaRawPtr, nVHeads * sizeof(float32), stream)
+              gpuDownloadFromDevice(addr gbuf[0], gateDecayPtr, nVHeads * sizeof(float32), stream)
+              gpuDownloadFromDevice(addr bsbuf[0], betaSigPtr, nVHeads * sizeof(float32), stream)
+              gpuStreamSync(stream)
+              echo "  L0 alpha[0..3]=", abuf[0..3], " beta_raw[0..3]=", bbuf[0..3]
+              echo "  L0 gate[0..3]=", gbuf[0..3], " beta_sig[0..3]=", bsbuf[0..3]
+              echo "  L0 exp(gate)[0..3]=", @[math.exp(float64(gbuf[0])), math.exp(float64(gbuf[1])), math.exp(float64(gbuf[2])), math.exp(float64(gbuf[3]))]
+        # Conv1d
+        gpuConv1dDecode(cache.ssmState.convState[ssmLayerIdx].devicePtr,
+                         tmp0, lw.ssmConv1dW, lw.ssmConv1dBias, tmp2,
+                         convDim, hp.ssmConvKernel, stream)
+        gpuSilu(tmp2, convDim, stream)
+        when defined(traceGdn):
+          if layer == 0 and t == seqLen - 1:
+            block:
+              var buf = newSeq[float32](convDim)
+              gpuDownloadFromDevice(addr buf[0], tmp2, convDim * sizeof(float32), stream)
+              gpuStreamSync(stream)
+              var ss = 0.0'f64
+              for ii in 0 ..< convDim:
+                ss += float64(buf[ii]) * float64(buf[ii])
+              echo "  L0 conv+silu rms=", formatFloat(math.sqrt(ss / float64(convDim)), ffDecimal, 6),
+                " Q_first5=", buf[0..4], " K_first5=", buf[qkDim..qkDim+4], " V_first5=", buf[2*qkDim..2*qkDim+4]
+        # Split Q, K, V from tmp2
+        let qConvPtr = tmp2
+        let kConvPtr = cast[pointer](cast[uint](tmp2) + uint(qkDim * sizeof(float32)))
+        let vConvPtr = cast[pointer](cast[uint](kConvPtr) + uint(qkDim * sizeof(float32)))
+        gpuL2NormPerHead(qConvPtr, nKHeads, headKDim, stream)
+        gpuL2NormPerHead(kConvPtr, nKHeads, headKDim, stream)
+        # Expand Q, K to nVHeads
+        let qExpPtr = tmp0
+        let kExpPtr = cast[pointer](cast[uint](tmp0) + uint(nVHeads * headKDim * sizeof(float32)))
+        gpuExpandHeads(qExpPtr, qConvPtr, nKHeads, nVHeads, headKDim, stream)
+        gpuExpandHeads(kExpPtr, kConvPtr, nKHeads, nVHeads, headKDim, stream)
+        when defined(traceGdn):
+          if layer == 0 and t == seqLen - 1:
+            block:
+              var qbuf = newSeq[float32](nVHeads * headKDim)
+              var kbuf = newSeq[float32](nVHeads * headKDim)
+              var vbuf = newSeq[float32](nVHeads * headVDim)
+              gpuDownloadFromDevice(addr qbuf[0], qExpPtr, qbuf.len * sizeof(float32), stream)
+              gpuDownloadFromDevice(addr kbuf[0], kExpPtr, kbuf.len * sizeof(float32), stream)
+              gpuDownloadFromDevice(addr vbuf[0], vConvPtr, vbuf.len * sizeof(float32), stream)
+              gpuStreamSync(stream)
+              var qss, kss, vss = 0.0'f64
+              for ii in 0 ..< qbuf.len: qss += float64(qbuf[ii]) * float64(qbuf[ii])
+              for ii in 0 ..< kbuf.len: kss += float64(kbuf[ii]) * float64(kbuf[ii])
+              for ii in 0 ..< vbuf.len: vss += float64(vbuf[ii]) * float64(vbuf[ii])
+              echo "  L0 Q_exp rms=", formatFloat(math.sqrt(qss / float64(qbuf.len)), ffDecimal, 6),
+                " K_exp rms=", formatFloat(math.sqrt(kss / float64(kbuf.len)), ffDecimal, 6),
+                " V rms=", formatFloat(math.sqrt(vss / float64(vbuf.len)), ffDecimal, 6)
+        # Delta Net recurrence
+        let dnOutPtr = tmp2
+        gpuDeltaNetDecode(cache.ssmState.recState[ssmLayerIdx].devicePtr,
+                           qExpPtr, kExpPtr, vConvPtr, gateDecayPtr, betaSigPtr, dnOutPtr,
+                           nVHeads, headKDim, headVDim, stream)
+        when defined(traceGdn):
+          if layer == 0 and t == seqLen - 1:
+            block:
+              var buf = newSeq[float32](nVHeads * headVDim)
+              gpuDownloadFromDevice(addr buf[0], dnOutPtr, buf.len * sizeof(float32), stream)
+              gpuStreamSync(stream)
+              var ss = 0.0'f64
+              for ii in 0 ..< buf.len:
+                ss += float64(buf[ii]) * float64(buf[ii])
+              echo "  L0 dn_out rms=", formatFloat(math.sqrt(ss / float64(buf.len)), ffDecimal, 6),
+                " first5=", buf[0..4]
+        # Gated RMS norm
+        gpuGatedRmsNorm(tmp0, dnOutPtr, tmp1, lw.ssmNorm, nVHeads, headVDim, hp.rmsEps, stream)
+        when defined(traceGdn):
+          if layer == 0 and t == seqLen - 1:
+            block:
+              var buf = newSeq[float32](hp.ssmInnerSize)
+              gpuDownloadFromDevice(addr buf[0], tmp0, buf.len * sizeof(float32), stream)
+              gpuStreamSync(stream)
+              var ss = 0.0'f64
+              for ii in 0 ..< buf.len:
+                ss += float64(buf[ii]) * float64(buf[ii])
+              echo "  L0 gated_rmsnorm rms=", formatFloat(math.sqrt(ss / float64(buf.len)), ffDecimal, 6),
+                " first5=", buf[0..4]
+        # Output projection
+        if lw.ssmOutQ != nil:
+          gpuLinearColQuant(tmp2, tmp0, lw.ssmOutQ, hp.ssmInnerSize, hp.nEmb, lw.ssmOutQType, stream)
+        else:
+          gpuLinearCol(tmp2, tmp0, lw.wGate, hp.ssmInnerSize, hp.nEmb, 1, stream)
+        when defined(traceGdn):
+          if layer == 0 and t == seqLen - 1:
+            block:
+              var buf = newSeq[float32](hp.nEmb)
+              gpuDownloadFromDevice(addr buf[0], tmp2, hp.nEmb * sizeof(float32), stream)
+              gpuStreamSync(stream)
+              var ss = 0.0'f64
+              for ii in 0 ..< hp.nEmb:
+                ss += float64(buf[ii]) * float64(buf[ii])
+              echo "  L0 out_proj rms=", formatFloat(math.sqrt(ss / float64(hp.nEmb)), ffDecimal, 6),
+                " first5=", buf[0..4]
+        gpuScatterAddCol(xPtr, tmp2, hp.nEmb, seqLen, t, stream)
+      # Post-attention norm on full sequence
+      let dPostNorm = loadF32Weight(lp & "post_attention_norm.weight")
+      gpuRmsnormCols(xNormPtr, xPtr, dPostNorm.devicePtr, hp.nEmb, seqLen, hp.rmsEps, stream)
+      # MoE FFN per-token
+      for t in 0 ..< seqLen:
+        gpuGatherCol(tmp2, xNormPtr, hp.nEmb, seqLen, t, stream)
+        gpuLinearCol(tmp0, tmp2, lw.moeRouterW, hp.nEmb, hp.nExperts, 1, stream)
+        let eiPtr = tmp3
+        let ewPtr = cast[pointer](cast[uint](tmp3) + uint(hp.nExpertsUsed * sizeof(int32)))
+        gpuMoeTopK(eiPtr, ewPtr, tmp0, hp.nExperts, hp.nExpertsUsed, stream)
+        var expertIndices: array[32, int32]
+        var expertWeights: array[32, float32]
+        gpuDownloadFromDevice(addr expertIndices[0], eiPtr, hp.nExpertsUsed * sizeof(int32), stream)
+        gpuDownloadFromDevice(addr expertWeights[0], ewPtr, hp.nExpertsUsed * sizeof(float32), stream)
+        gpuStreamSync(stream)
+        gpuZeroBuffer(tmp1, hp.nEmb, stream)
+        for e in 0 ..< hp.nExpertsUsed:
+          let eidx = int(expertIndices[e])
+          let gateOff = cast[pointer](cast[uint](lw.moeGateExpsQ) + uint(eidx * lw.moeGateExpsSliceBytes))
+          gpuLinearColQuant(tmp0, tmp2, gateOff, hp.nEmb, hp.expertFfnDim, lw.moeGateExpsQType, stream)
+          let upOff = cast[pointer](cast[uint](lw.moeUpExpsQ) + uint(eidx * lw.moeUpExpsSliceBytes))
+          gpuLinearColQuant(tmp3, tmp2, upOff, hp.nEmb, hp.expertFfnDim, lw.moeUpExpsQType, stream)
+          gpuSiluMul(tmp0, tmp0, tmp3, hp.expertFfnDim, stream)
+          let downOff = cast[pointer](cast[uint](lw.moeDownExpsQ) + uint(eidx * lw.moeDownExpsSliceBytes))
+          gpuLinearColQuant(tmp3, tmp0, downOff, hp.expertFfnDim, hp.nEmb, lw.moeDownExpsQType, stream)
+          gpuScaleAdd(tmp1, tmp3, expertWeights[e], hp.nEmb, stream)
+        if lw.moeShGateQ != nil:
+          gpuLinearColQuant(tmp0, tmp2, lw.moeShGateQ, hp.nEmb, hp.expertFfnDim, lw.moeShGateQType, stream)
+        else:
+          gpuLinearCol(tmp0, tmp2, lw.wGate, hp.nEmb, hp.expertFfnDim, 1, stream)
+        if lw.moeShUpQ != nil:
+          gpuLinearColQuant(tmp3, tmp2, lw.moeShUpQ, hp.nEmb, hp.expertFfnDim, lw.moeShUpQType, stream)
+        else:
+          gpuLinearCol(tmp3, tmp2, lw.wUp, hp.nEmb, hp.expertFfnDim, 1, stream)
+        gpuSiluMul(tmp0, tmp0, tmp3, hp.expertFfnDim, stream)
+        if lw.moeShDownQ != nil:
+          gpuLinearColQuant(tmp3, tmp0, lw.moeShDownQ, hp.expertFfnDim, hp.nEmb, lw.moeShDownQType, stream)
+        else:
+          gpuLinearCol(tmp3, tmp0, lw.wDown, hp.expertFfnDim, hp.nEmb, 1, stream)
+        gpuSharedExpertGate(tmp3, tmp2, lw.moeShGateScalar, hp.nEmb, stream)
+        gpuAdd(tmp0, tmp1, tmp3, hp.nEmb, stream)
+        gpuScatterAddCol(xPtr, tmp0, hp.nEmb, seqLen, t, stream)
+      continue
+
   let outTName = if m.infos.hasKey("output.weight"): "output.weight"
                  else: "token_embd.weight"
   let dNorm = loadF32Weight(if m.infos.hasKey("norm.weight"): "norm.weight"
@@ -3390,7 +4309,7 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
 # ---------------------------------------------------------------------------
 proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
   let hp = m.hparams
-  if hp.arch != "" and hp.arch notin ["llama", "qwen3", "nemotron_h"]:
+  if hp.arch != "" and hp.arch notin ["llama", "qwen3", "nemotron_h", "qwen35moe"]:
     raise newException(ValueError, "unsupported architecture: " & hp.arch)
   if hp.nHeadKv != 0 and hp.nHead > 0 and (hp.nHead mod hp.nHeadKv) != 0:
     raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
@@ -3411,6 +4330,9 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
   maxRows = max(maxRows, ssmProjDim)
   for i in 0 ..< hp.layerNFfn.len:
     maxRows = max(maxRows, hp.layerNFfn[i])
+  if hp.nExperts > 0:
+    maxRows = max(maxRows, hp.nExperts)
+    maxRows = max(maxRows, qDim + 2 * kvDim)
   ensureActivationBuffers(maxRows)
   ensureScratchBuffers(maxRows)
   let stream = gpuCtx.stream
@@ -3432,6 +4354,7 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
   let tmp0 = gpuCtx.scratch0.devicePtr
   let tmp1 = gpuCtx.scratch1.devicePtr
   let tmp2 = gpuCtx.scratch2.devicePtr
+  let tmp3 = gpuCtx.scratch3.devicePtr
 
   when defined(profileHippo):
     recordStart(eventPairs, KcEmbedding, stream)
@@ -3643,6 +4566,165 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
       else:
         gpuLinearCol(tmp0, tmp2, lw.wDown, ssmInner, hp.nEmb, 1, stream)
 
+    of lkAttnMoe:
+      let qFullDim = 2 * qDim
+      if lw.wqQ != nil:
+        gpuLinearColQuant(tmp2, xNormPtr, lw.wqQ, hp.nEmb, qFullDim, lw.wqQType, stream)
+      else:
+        gpuLinearCol(tmp2, xNormPtr, lw.wq, hp.nEmb, qFullDim, 1, stream)
+      gpuDeinterleaveQGate(tmp0, tmp3, tmp2, hp.nHead, headDim, stream)
+      if lw.wkQ != nil:
+        gpuLinearColQuant(tmp1, xNormPtr, lw.wkQ, hp.nEmb, kvDim, lw.wkQType, stream)
+      else:
+        gpuLinearCol(tmp1, xNormPtr, lw.wk, hp.nEmb, kvDim, 1, stream)
+      if lw.wvQ != nil:
+        gpuLinearColQuant(tmp2, xNormPtr, lw.wvQ, hp.nEmb, kvDim, lw.wvQType, stream)
+      else:
+        gpuLinearCol(tmp2, xNormPtr, lw.wv, hp.nEmb, kvDim, 1, stream)
+      if lw.attnQNorm != nil:
+        gpuQkNorm(tmp0, lw.attnQNorm, hp.nHead, headDim, hp.rmsEps, stream)
+      if lw.attnKNorm != nil:
+        gpuQkNorm(tmp1, lw.attnKNorm, hp.nHeadKv, headDim, hp.rmsEps, stream)
+      gpuFusedRopeStoreKV(tmp0, tmp1, tmp2,
+                          cache.gpuCache.k[layer].devicePtr,
+                          cache.gpuCache.v[layer].devicePtr,
+                          hp.nHead, hp.nHeadKv, headDim, ropeDim,
+                          kvDim, cache.gpuCache.maxLen, pos, stream)
+      gpuAttentionDecode(xNormPtr, tmp0, cache.gpuCache.k[layer].devicePtr,
+                         cache.gpuCache.v[layer].devicePtr,
+                         hp.nHead, hp.nHeadKv, headDim, pos + 1,
+                         cache.gpuCache.maxLen, stream)
+      gpuAttnGate(xNormPtr, tmp3, qDim, stream)
+      if lw.woQ != nil:
+        gpuLinearColQuant(tmp0, xNormPtr, lw.woQ, qDim, hp.nEmb, lw.woQType, stream)
+      else:
+        gpuLinearCol(tmp0, xNormPtr, lw.wo, qDim, hp.nEmb, 1, stream)
+      gpuResidualRmsnorm(xNormPtr, xPtr, tmp0, lw.postAttnNorm, hp.nEmb, hp.rmsEps, stream)
+      gpuLinearCol(tmp0, xNormPtr, lw.moeRouterW, hp.nEmb, hp.nExperts, 1, stream)
+      let eiPtr = tmp3
+      let ewPtr = cast[pointer](cast[uint](tmp3) + uint(hp.nExpertsUsed * sizeof(int32)))
+      gpuMoeTopK(eiPtr, ewPtr, tmp0, hp.nExperts, hp.nExpertsUsed, stream)
+      var expertIndices: array[32, int32]
+      var expertWeights: array[32, float32]
+      gpuDownloadFromDevice(addr expertIndices[0], eiPtr, hp.nExpertsUsed * sizeof(int32), stream)
+      gpuDownloadFromDevice(addr expertWeights[0], ewPtr, hp.nExpertsUsed * sizeof(float32), stream)
+      gpuStreamSync(stream)
+      gpuZeroBuffer(tmp2, hp.nEmb, stream)
+      for e in 0 ..< hp.nExpertsUsed:
+        let eidx = int(expertIndices[e])
+        let gateOff = cast[pointer](cast[uint](lw.moeGateExpsQ) + uint(eidx * lw.moeGateExpsSliceBytes))
+        gpuLinearColQuant(tmp0, xNormPtr, gateOff, hp.nEmb, hp.expertFfnDim, lw.moeGateExpsQType, stream)
+        let upOff = cast[pointer](cast[uint](lw.moeUpExpsQ) + uint(eidx * lw.moeUpExpsSliceBytes))
+        gpuLinearColQuant(tmp1, xNormPtr, upOff, hp.nEmb, hp.expertFfnDim, lw.moeUpExpsQType, stream)
+        gpuSiluMul(tmp0, tmp0, tmp1, hp.expertFfnDim, stream)
+        let downOff = cast[pointer](cast[uint](lw.moeDownExpsQ) + uint(eidx * lw.moeDownExpsSliceBytes))
+        gpuLinearColQuant(tmp1, tmp0, downOff, hp.expertFfnDim, hp.nEmb, lw.moeDownExpsQType, stream)
+        gpuScaleAdd(tmp2, tmp1, expertWeights[e], hp.nEmb, stream)
+      if lw.moeShGateQ != nil:
+        gpuLinearColQuant(tmp0, xNormPtr, lw.moeShGateQ, hp.nEmb, hp.expertFfnDim, lw.moeShGateQType, stream)
+      else:
+        gpuLinearCol(tmp0, xNormPtr, lw.wGate, hp.nEmb, hp.expertFfnDim, 1, stream)
+      if lw.moeShUpQ != nil:
+        gpuLinearColQuant(tmp1, xNormPtr, lw.moeShUpQ, hp.nEmb, hp.expertFfnDim, lw.moeShUpQType, stream)
+      else:
+        gpuLinearCol(tmp1, xNormPtr, lw.wUp, hp.nEmb, hp.expertFfnDim, 1, stream)
+      gpuSiluMul(tmp0, tmp0, tmp1, hp.expertFfnDim, stream)
+      if lw.moeShDownQ != nil:
+        gpuLinearColQuant(tmp1, tmp0, lw.moeShDownQ, hp.expertFfnDim, hp.nEmb, lw.moeShDownQType, stream)
+      else:
+        gpuLinearCol(tmp1, tmp0, lw.wDown, hp.expertFfnDim, hp.nEmb, 1, stream)
+      gpuSharedExpertGate(tmp1, xNormPtr, lw.moeShGateScalar, hp.nEmb, stream)
+      gpuAdd(tmp0, tmp2, tmp1, hp.nEmb, stream)
+
+    of lkSsmAttnMoe:
+      let nVHeads = hp.ssmDtRank
+      let nKHeads = hp.ssmGroupCount
+      let headKDim = hp.ssmStateSize
+      let headVDim = hp.ssmInnerSize div nVHeads
+      let convDim = 2 * nKHeads * headKDim + hp.ssmInnerSize
+      let qkDim = nKHeads * headKDim
+      if lw.wqkvQ != nil:
+        gpuLinearColQuant(tmp0, xNormPtr, lw.wqkvQ, hp.nEmb, convDim, lw.wqkvQType, stream)
+      else:
+        gpuLinearCol(tmp0, xNormPtr, lw.wq, hp.nEmb, convDim, 1, stream)
+      if lw.ssmGateQ != nil:
+        gpuLinearColQuant(tmp2, xNormPtr, lw.ssmGateQ, hp.nEmb, hp.ssmInnerSize, lw.ssmGateQType, stream)
+      else:
+        gpuLinearCol(tmp2, xNormPtr, lw.wo, hp.nEmb, hp.ssmInnerSize, 1, stream)
+      let alphaPtr = tmp3
+      let betaRawPtr = cast[pointer](cast[uint](tmp3) + uint(nVHeads * sizeof(float32)))
+      if lw.ssmAlphaQ != nil:
+        gpuLinearColQuant(alphaPtr, xNormPtr, lw.ssmAlphaQ, hp.nEmb, nVHeads, lw.ssmAlphaQType, stream)
+      else:
+        gpuLinearCol(alphaPtr, xNormPtr, lw.wk, hp.nEmb, nVHeads, 1, stream)
+      if lw.ssmBetaQ != nil:
+        gpuLinearColQuant(betaRawPtr, xNormPtr, lw.ssmBetaQ, hp.nEmb, nVHeads, lw.ssmBetaQType, stream)
+      else:
+        gpuLinearCol(betaRawPtr, xNormPtr, lw.wv, hp.nEmb, nVHeads, 1, stream)
+      let gateDecayPtr = cast[pointer](cast[uint](tmp3) + uint(2 * nVHeads * sizeof(float32)))
+      let betaSigPtr = cast[pointer](cast[uint](tmp3) + uint(3 * nVHeads * sizeof(float32)))
+      gpuDeltaNetGate(gateDecayPtr, betaSigPtr, alphaPtr, lw.ssmDtBias, lw.ssmA, betaRawPtr,
+                       nVHeads, stream)
+      let ssmLayerIdx = cache.ssmState.ssmLayerMap[layer]
+      gpuConv1dDecode(cache.ssmState.convState[ssmLayerIdx].devicePtr,
+                       tmp0, lw.ssmConv1dW, lw.ssmConv1dBias, tmp1,
+                       convDim, hp.ssmConvKernel, stream)
+      gpuSilu(tmp1, convDim, stream)
+      let qConvPtr = tmp1
+      let kConvPtr = cast[pointer](cast[uint](tmp1) + uint(qkDim * sizeof(float32)))
+      let vConvPtr = cast[pointer](cast[uint](kConvPtr) + uint(qkDim * sizeof(float32)))
+      gpuL2NormPerHead(qConvPtr, nKHeads, headKDim, stream)
+      gpuL2NormPerHead(kConvPtr, nKHeads, headKDim, stream)
+      let qExpPtr = tmp0
+      let kExpPtr = cast[pointer](cast[uint](tmp0) + uint(nVHeads * headKDim * sizeof(float32)))
+      gpuExpandHeads(qExpPtr, qConvPtr, nKHeads, nVHeads, headKDim, stream)
+      gpuExpandHeads(kExpPtr, kConvPtr, nKHeads, nVHeads, headKDim, stream)
+      let dnOutPtr = tmp1
+      gpuDeltaNetDecode(cache.ssmState.recState[ssmLayerIdx].devicePtr,
+                         qExpPtr, kExpPtr, vConvPtr, gateDecayPtr, betaSigPtr, dnOutPtr,
+                         nVHeads, headKDim, headVDim, stream)
+      gpuGatedRmsNorm(tmp0, dnOutPtr, tmp2, lw.ssmNorm, nVHeads, headVDim, hp.rmsEps, stream)
+      if lw.ssmOutQ != nil:
+        gpuLinearColQuant(tmp1, tmp0, lw.ssmOutQ, hp.ssmInnerSize, hp.nEmb, lw.ssmOutQType, stream)
+      else:
+        gpuLinearCol(tmp1, tmp0, lw.wGate, hp.ssmInnerSize, hp.nEmb, 1, stream)
+      gpuResidualRmsnorm(xNormPtr, xPtr, tmp1, lw.postAttnNorm, hp.nEmb, hp.rmsEps, stream)
+      gpuLinearCol(tmp0, xNormPtr, lw.moeRouterW, hp.nEmb, hp.nExperts, 1, stream)
+      let eiPtr = tmp3
+      let ewPtr = cast[pointer](cast[uint](tmp3) + uint(hp.nExpertsUsed * sizeof(int32)))
+      gpuMoeTopK(eiPtr, ewPtr, tmp0, hp.nExperts, hp.nExpertsUsed, stream)
+      var expertIndices: array[32, int32]
+      var expertWeights: array[32, float32]
+      gpuDownloadFromDevice(addr expertIndices[0], eiPtr, hp.nExpertsUsed * sizeof(int32), stream)
+      gpuDownloadFromDevice(addr expertWeights[0], ewPtr, hp.nExpertsUsed * sizeof(float32), stream)
+      gpuStreamSync(stream)
+      gpuZeroBuffer(tmp2, hp.nEmb, stream)
+      for e in 0 ..< hp.nExpertsUsed:
+        let eidx = int(expertIndices[e])
+        let gateOff = cast[pointer](cast[uint](lw.moeGateExpsQ) + uint(eidx * lw.moeGateExpsSliceBytes))
+        gpuLinearColQuant(tmp0, xNormPtr, gateOff, hp.nEmb, hp.expertFfnDim, lw.moeGateExpsQType, stream)
+        let upOff = cast[pointer](cast[uint](lw.moeUpExpsQ) + uint(eidx * lw.moeUpExpsSliceBytes))
+        gpuLinearColQuant(tmp1, xNormPtr, upOff, hp.nEmb, hp.expertFfnDim, lw.moeUpExpsQType, stream)
+        gpuSiluMul(tmp0, tmp0, tmp1, hp.expertFfnDim, stream)
+        let downOff = cast[pointer](cast[uint](lw.moeDownExpsQ) + uint(eidx * lw.moeDownExpsSliceBytes))
+        gpuLinearColQuant(tmp1, tmp0, downOff, hp.expertFfnDim, hp.nEmb, lw.moeDownExpsQType, stream)
+        gpuScaleAdd(tmp2, tmp1, expertWeights[e], hp.nEmb, stream)
+      if lw.moeShGateQ != nil:
+        gpuLinearColQuant(tmp0, xNormPtr, lw.moeShGateQ, hp.nEmb, hp.expertFfnDim, lw.moeShGateQType, stream)
+      else:
+        gpuLinearCol(tmp0, xNormPtr, lw.wGate, hp.nEmb, hp.expertFfnDim, 1, stream)
+      if lw.moeShUpQ != nil:
+        gpuLinearColQuant(tmp1, xNormPtr, lw.moeShUpQ, hp.nEmb, hp.expertFfnDim, lw.moeShUpQType, stream)
+      else:
+        gpuLinearCol(tmp1, xNormPtr, lw.wUp, hp.nEmb, hp.expertFfnDim, 1, stream)
+      gpuSiluMul(tmp0, tmp0, tmp1, hp.expertFfnDim, stream)
+      if lw.moeShDownQ != nil:
+        gpuLinearColQuant(tmp1, tmp0, lw.moeShDownQ, hp.expertFfnDim, hp.nEmb, lw.moeShDownQType, stream)
+      else:
+        gpuLinearCol(tmp1, tmp0, lw.wDown, hp.expertFfnDim, hp.nEmb, 1, stream)
+      gpuSharedExpertGate(tmp1, xNormPtr, lw.moeShGateScalar, hp.nEmb, stream)
+      gpuAdd(tmp0, tmp2, tmp1, hp.nEmb, stream)
+
     when defined(profileHippo):
       recordStop(eventPairs, stream)
       recordStart(eventPairs, KcResidualFfn, stream)
@@ -3653,6 +4735,7 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
                           hp.nEmb, hp.rmsEps, stream)
     else:
       gpuAdd(xPtr, xPtr, tmp0, hp.nEmb, stream)
+
     when defined(profileHippo):
       recordStop(eventPairs, stream)
       kernelLaunchMs += (epochTime() - klStart) * 1000
@@ -3699,7 +4782,7 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
 
 proc forwardDecodeToken*(m: var Model, token: int32, cache: var KvCache): int32 =
   let hp = m.hparams
-  if hp.arch != "" and hp.arch notin ["llama", "qwen3", "nemotron_h"]:
+  if hp.arch != "" and hp.arch notin ["llama", "qwen3", "nemotron_h", "qwen35moe"]:
     raise newException(ValueError, "unsupported architecture: " & hp.arch)
   if hp.nHeadKv != 0 and hp.nHead > 0 and (hp.nHead mod hp.nHeadKv) != 0:
     raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
@@ -3720,6 +4803,9 @@ proc forwardDecodeToken*(m: var Model, token: int32, cache: var KvCache): int32 
   maxRows = max(maxRows, ssmProjDim)
   for i in 0 ..< hp.layerNFfn.len:
     maxRows = max(maxRows, hp.layerNFfn[i])
+  if hp.nExperts > 0:
+    maxRows = max(maxRows, hp.nExperts)
+    maxRows = max(maxRows, qDim + 2 * kvDim)
   ensureActivationBuffers(maxRows)
   ensureScratchBuffers(maxRows)
   let stream = gpuCtx.stream
@@ -3734,6 +4820,7 @@ proc forwardDecodeToken*(m: var Model, token: int32, cache: var KvCache): int32 
   let tmp0 = gpuCtx.scratch0.devicePtr
   let tmp1 = gpuCtx.scratch1.devicePtr
   let tmp2 = gpuCtx.scratch2.devicePtr
+  let tmp3 = gpuCtx.scratch3.devicePtr
 
   gpuEmbedding(xPtr, modelPtrs.tokEmb, cast[ptr int32](tokenPtr),
                hp.nEmb, 1, hp.nVocab, stream)
@@ -3895,6 +4982,193 @@ proc forwardDecodeToken*(m: var Model, token: int32, cache: var KvCache): int32 
         gpuLinearColQuant(tmp0, tmp2, lw.ssmOutQ, ssmInner, hp.nEmb, lw.ssmOutQType, stream)
       else:
         gpuLinearCol(tmp0, tmp2, lw.wDown, ssmInner, hp.nEmb, 1, stream)
+
+    of lkAttnMoe:
+      # Full attention + gated Q + MoE FFN (every 4th layer)
+      # Q projection outputs Q+gate interleaved: [Q0(hd), G0(hd), Q1(hd), G1(hd), ...]
+      let qFullDim = 2 * qDim
+      if lw.wqQ != nil:
+        gpuLinearColQuant(tmp2, xNormPtr, lw.wqQ, hp.nEmb, qFullDim, lw.wqQType, stream)
+      else:
+        gpuLinearCol(tmp2, xNormPtr, lw.wq, hp.nEmb, qFullDim, 1, stream)
+      # De-interleave: tmp0=Q[qDim], tmp3=gate[qDim]
+      gpuDeinterleaveQGate(tmp0, tmp3, tmp2, hp.nHead, headDim, stream)
+      # K, V projections
+      if lw.wkQ != nil:
+        gpuLinearColQuant(tmp1, xNormPtr, lw.wkQ, hp.nEmb, kvDim, lw.wkQType, stream)
+      else:
+        gpuLinearCol(tmp1, xNormPtr, lw.wk, hp.nEmb, kvDim, 1, stream)
+      if lw.wvQ != nil:
+        gpuLinearColQuant(tmp2, xNormPtr, lw.wvQ, hp.nEmb, kvDim, lw.wvQType, stream)
+      else:
+        gpuLinearCol(tmp2, xNormPtr, lw.wv, hp.nEmb, kvDim, 1, stream)
+      # tmp0=Q, tmp1=K, tmp2=V, tmp3=gate
+      if lw.attnQNorm != nil:
+        gpuQkNorm(tmp0, lw.attnQNorm, hp.nHead, headDim, hp.rmsEps, stream)
+      if lw.attnKNorm != nil:
+        gpuQkNorm(tmp1, lw.attnKNorm, hp.nHeadKv, headDim, hp.rmsEps, stream)
+      gpuFusedRopeStoreKV(tmp0, tmp1, tmp2,
+                          cache.gpuCache.k[layer].devicePtr,
+                          cache.gpuCache.v[layer].devicePtr,
+                          hp.nHead, hp.nHeadKv, headDim, ropeDim,
+                          kvDim, cache.gpuCache.maxLen, pos, stream)
+      gpuAttentionDecode(xNormPtr, tmp0, cache.gpuCache.k[layer].devicePtr,
+                         cache.gpuCache.v[layer].devicePtr,
+                         hp.nHead, hp.nHeadKv, headDim, pos + 1,
+                         cache.gpuCache.maxLen, stream)
+      # Apply attention gate: xNormPtr = sigmoid(gate) * xNormPtr
+      gpuAttnGate(xNormPtr, tmp3, qDim, stream)
+      if lw.woQ != nil:
+        gpuLinearColQuant(tmp0, xNormPtr, lw.woQ, qDim, hp.nEmb, lw.woQType, stream)
+      else:
+        gpuLinearCol(tmp0, xNormPtr, lw.wo, qDim, hp.nEmb, 1, stream)
+      # First residual + post_attention_norm
+      gpuResidualRmsnorm(xNormPtr, xPtr, tmp0, lw.postAttnNorm, hp.nEmb, hp.rmsEps, stream)
+      # MoE FFN: router → top-K → sequential expert eval → shared expert → accumulate
+      gpuLinearCol(tmp0, xNormPtr, lw.moeRouterW, hp.nEmb, hp.nExperts, 1, stream)
+      let eiPtr = tmp3
+      let ewPtr = cast[pointer](cast[uint](tmp3) + uint(hp.nExpertsUsed * sizeof(int32)))
+      gpuMoeTopK(eiPtr, ewPtr, tmp0, hp.nExperts, hp.nExpertsUsed, stream)
+      var expertIndices: array[32, int32]
+      var expertWeights: array[32, float32]
+      gpuDownloadFromDevice(addr expertIndices[0], eiPtr, hp.nExpertsUsed * sizeof(int32), stream)
+      gpuDownloadFromDevice(addr expertWeights[0], ewPtr, hp.nExpertsUsed * sizeof(float32), stream)
+      gpuStreamSync(stream)
+      gpuZeroBuffer(tmp2, hp.nEmb, stream)
+      for e in 0 ..< hp.nExpertsUsed:
+        let eidx = int(expertIndices[e])
+        let gateOff = cast[pointer](cast[uint](lw.moeGateExpsQ) + uint(eidx * lw.moeGateExpsSliceBytes))
+        gpuLinearColQuant(tmp0, xNormPtr, gateOff, hp.nEmb, hp.expertFfnDim, lw.moeGateExpsQType, stream)
+        let upOff = cast[pointer](cast[uint](lw.moeUpExpsQ) + uint(eidx * lw.moeUpExpsSliceBytes))
+        gpuLinearColQuant(tmp1, xNormPtr, upOff, hp.nEmb, hp.expertFfnDim, lw.moeUpExpsQType, stream)
+        gpuSiluMul(tmp0, tmp0, tmp1, hp.expertFfnDim, stream)
+        let downOff = cast[pointer](cast[uint](lw.moeDownExpsQ) + uint(eidx * lw.moeDownExpsSliceBytes))
+        gpuLinearColQuant(tmp1, tmp0, downOff, hp.expertFfnDim, hp.nEmb, lw.moeDownExpsQType, stream)
+        gpuScaleAdd(tmp2, tmp1, expertWeights[e], hp.nEmb, stream)
+      # Shared expert
+      if lw.moeShGateQ != nil:
+        gpuLinearColQuant(tmp0, xNormPtr, lw.moeShGateQ, hp.nEmb, hp.expertFfnDim, lw.moeShGateQType, stream)
+      else:
+        gpuLinearCol(tmp0, xNormPtr, lw.wGate, hp.nEmb, hp.expertFfnDim, 1, stream)
+      if lw.moeShUpQ != nil:
+        gpuLinearColQuant(tmp1, xNormPtr, lw.moeShUpQ, hp.nEmb, hp.expertFfnDim, lw.moeShUpQType, stream)
+      else:
+        gpuLinearCol(tmp1, xNormPtr, lw.wUp, hp.nEmb, hp.expertFfnDim, 1, stream)
+      gpuSiluMul(tmp0, tmp0, tmp1, hp.expertFfnDim, stream)
+      if lw.moeShDownQ != nil:
+        gpuLinearColQuant(tmp1, tmp0, lw.moeShDownQ, hp.expertFfnDim, hp.nEmb, lw.moeShDownQType, stream)
+      else:
+        gpuLinearCol(tmp1, tmp0, lw.wDown, hp.expertFfnDim, hp.nEmb, 1, stream)
+      gpuSharedExpertGate(tmp1, xNormPtr, lw.moeShGateScalar, hp.nEmb, stream)
+      gpuAdd(tmp0, tmp2, tmp1, hp.nEmb, stream)
+
+    of lkSsmAttnMoe:
+      # Gated Delta Net + MoE FFN
+      let nVHeads = hp.ssmDtRank         # 32
+      let nKHeads = hp.ssmGroupCount     # 16
+      let headKDim = hp.ssmStateSize     # 128
+      let headVDim = hp.ssmInnerSize div nVHeads  # 128
+      let convDim = 2 * nKHeads * headKDim + hp.ssmInnerSize  # 8192
+      let qkDim = nKHeads * headKDim     # 2048
+      # 1. QKV projection: xNormPtr[nEmb] → tmp0[convDim=8192]
+      if lw.wqkvQ != nil:
+        gpuLinearColQuant(tmp0, xNormPtr, lw.wqkvQ, hp.nEmb, convDim, lw.wqkvQType, stream)
+      else:
+        gpuLinearCol(tmp0, xNormPtr, lw.wq, hp.nEmb, convDim, 1, stream)
+      # 2. Gate (z) projection: xNormPtr[nEmb] → tmp2[ssmInnerSize=4096]
+      if lw.ssmGateQ != nil:
+        gpuLinearColQuant(tmp2, xNormPtr, lw.ssmGateQ, hp.nEmb, hp.ssmInnerSize, lw.ssmGateQType, stream)
+      else:
+        gpuLinearCol(tmp2, xNormPtr, lw.wo, hp.nEmb, hp.ssmInnerSize, 1, stream)
+      # 3. Alpha/beta projections: xNormPtr[nEmb] → [nVHeads=32] each
+      #    We place alpha at tmp3[0..nVHeads-1] and beta_raw at tmp3[nVHeads..2*nVHeads-1]
+      let alphaPtr = tmp3
+      let betaRawPtr = cast[pointer](cast[uint](tmp3) + uint(nVHeads * sizeof(float32)))
+      if lw.ssmAlphaQ != nil:
+        gpuLinearColQuant(alphaPtr, xNormPtr, lw.ssmAlphaQ, hp.nEmb, nVHeads, lw.ssmAlphaQType, stream)
+      else:
+        gpuLinearCol(alphaPtr, xNormPtr, lw.wk, hp.nEmb, nVHeads, 1, stream)
+      if lw.ssmBetaQ != nil:
+        gpuLinearColQuant(betaRawPtr, xNormPtr, lw.ssmBetaQ, hp.nEmb, nVHeads, lw.ssmBetaQType, stream)
+      else:
+        gpuLinearCol(betaRawPtr, xNormPtr, lw.wv, hp.nEmb, nVHeads, 1, stream)
+      # 4. Compute gate = softplus(alpha + dt_bias) * A, beta = sigmoid(beta_raw)
+      let gateDecayPtr = cast[pointer](cast[uint](tmp3) + uint(2 * nVHeads * sizeof(float32)))
+      let betaSigPtr = cast[pointer](cast[uint](tmp3) + uint(3 * nVHeads * sizeof(float32)))
+      gpuDeltaNetGate(gateDecayPtr, betaSigPtr, alphaPtr, lw.ssmDtBias, lw.ssmA, betaRawPtr,
+                       nVHeads, stream)
+      # 5. Conv1d on QKV mixed: tmp0[convDim] → tmp1[convDim]
+      let ssmLayerIdx = cache.ssmState.ssmLayerMap[layer]
+      gpuConv1dDecode(cache.ssmState.convState[ssmLayerIdx].devicePtr,
+                       tmp0, lw.ssmConv1dW, lw.ssmConv1dBias, tmp1,
+                       convDim, hp.ssmConvKernel, stream)
+      # 6. SiLU activation on conv output
+      gpuSilu(tmp1, convDim, stream)
+      # 7. Split Q[nKHeads*headKDim], K[nKHeads*headKDim], V[nVHeads*headVDim] from tmp1
+      let qConvPtr = tmp1                # Q at start
+      let kConvPtr = cast[pointer](cast[uint](tmp1) + uint(qkDim * sizeof(float32)))
+      let vConvPtr = cast[pointer](cast[uint](kConvPtr) + uint(qkDim * sizeof(float32)))
+      # 8. L2 normalize Q and K per head
+      gpuL2NormPerHead(qConvPtr, nKHeads, headKDim, stream)
+      gpuL2NormPerHead(kConvPtr, nKHeads, headKDim, stream)
+      # 9. Expand Q, K from nKHeads to nVHeads (repeat interleave)
+      #    We need separate buffers: use tmp0 for expanded Q, scratch for expanded K
+      let qExpPtr = tmp0
+      let kExpPtr = cast[pointer](cast[uint](tmp0) + uint(nVHeads * headKDim * sizeof(float32)))
+      gpuExpandHeads(qExpPtr, qConvPtr, nKHeads, nVHeads, headKDim, stream)
+      gpuExpandHeads(kExpPtr, kConvPtr, nKHeads, nVHeads, headKDim, stream)
+      # 10. Delta Net recurrence: updates state, produces output[nVHeads*headVDim]
+      let dnOutPtr = tmp1  # reuse tmp1 for output
+      gpuDeltaNetDecode(cache.ssmState.recState[ssmLayerIdx].devicePtr,
+                         qExpPtr, kExpPtr, vConvPtr, gateDecayPtr, betaSigPtr, dnOutPtr,
+                         nVHeads, headKDim, headVDim, stream)
+      # 11. Gated RMS norm: rms_norm(output) * silu(z) using ssm_norm.weight
+      #     dnOutPtr=tmp1[ssmInnerSize], z=tmp2[ssmInnerSize] → tmp0[ssmInnerSize]
+      gpuGatedRmsNorm(tmp0, dnOutPtr, tmp2, lw.ssmNorm, nVHeads, headVDim, hp.rmsEps, stream)
+      # 12. Output projection: tmp0[ssmInnerSize] → tmp1[nEmb]
+      if lw.ssmOutQ != nil:
+        gpuLinearColQuant(tmp1, tmp0, lw.ssmOutQ, hp.ssmInnerSize, hp.nEmb, lw.ssmOutQType, stream)
+      else:
+        gpuLinearCol(tmp1, tmp0, lw.wGate, hp.ssmInnerSize, hp.nEmb, 1, stream)
+      # First residual + post_attention_norm
+      gpuResidualRmsnorm(xNormPtr, xPtr, tmp1, lw.postAttnNorm, hp.nEmb, hp.rmsEps, stream)
+      # MoE FFN (same as lkAttnMoe)
+      gpuLinearCol(tmp0, xNormPtr, lw.moeRouterW, hp.nEmb, hp.nExperts, 1, stream)
+      let eiPtr = tmp3
+      let ewPtr = cast[pointer](cast[uint](tmp3) + uint(hp.nExpertsUsed * sizeof(int32)))
+      gpuMoeTopK(eiPtr, ewPtr, tmp0, hp.nExperts, hp.nExpertsUsed, stream)
+      var expertIndices: array[32, int32]
+      var expertWeights: array[32, float32]
+      gpuDownloadFromDevice(addr expertIndices[0], eiPtr, hp.nExpertsUsed * sizeof(int32), stream)
+      gpuDownloadFromDevice(addr expertWeights[0], ewPtr, hp.nExpertsUsed * sizeof(float32), stream)
+      gpuStreamSync(stream)
+      gpuZeroBuffer(tmp2, hp.nEmb, stream)
+      for e in 0 ..< hp.nExpertsUsed:
+        let eidx = int(expertIndices[e])
+        let gateOff = cast[pointer](cast[uint](lw.moeGateExpsQ) + uint(eidx * lw.moeGateExpsSliceBytes))
+        gpuLinearColQuant(tmp0, xNormPtr, gateOff, hp.nEmb, hp.expertFfnDim, lw.moeGateExpsQType, stream)
+        let upOff = cast[pointer](cast[uint](lw.moeUpExpsQ) + uint(eidx * lw.moeUpExpsSliceBytes))
+        gpuLinearColQuant(tmp1, xNormPtr, upOff, hp.nEmb, hp.expertFfnDim, lw.moeUpExpsQType, stream)
+        gpuSiluMul(tmp0, tmp0, tmp1, hp.expertFfnDim, stream)
+        let downOff = cast[pointer](cast[uint](lw.moeDownExpsQ) + uint(eidx * lw.moeDownExpsSliceBytes))
+        gpuLinearColQuant(tmp1, tmp0, downOff, hp.expertFfnDim, hp.nEmb, lw.moeDownExpsQType, stream)
+        gpuScaleAdd(tmp2, tmp1, expertWeights[e], hp.nEmb, stream)
+      # Shared expert
+      if lw.moeShGateQ != nil:
+        gpuLinearColQuant(tmp0, xNormPtr, lw.moeShGateQ, hp.nEmb, hp.expertFfnDim, lw.moeShGateQType, stream)
+      else:
+        gpuLinearCol(tmp0, xNormPtr, lw.wGate, hp.nEmb, hp.expertFfnDim, 1, stream)
+      if lw.moeShUpQ != nil:
+        gpuLinearColQuant(tmp1, xNormPtr, lw.moeShUpQ, hp.nEmb, hp.expertFfnDim, lw.moeShUpQType, stream)
+      else:
+        gpuLinearCol(tmp1, xNormPtr, lw.wUp, hp.nEmb, hp.expertFfnDim, 1, stream)
+      gpuSiluMul(tmp0, tmp0, tmp1, hp.expertFfnDim, stream)
+      if lw.moeShDownQ != nil:
+        gpuLinearColQuant(tmp1, tmp0, lw.moeShDownQ, hp.expertFfnDim, hp.nEmb, lw.moeShDownQType, stream)
+      else:
+        gpuLinearCol(tmp1, tmp0, lw.wDown, hp.expertFfnDim, hp.nEmb, 1, stream)
+      gpuSharedExpertGate(tmp1, xNormPtr, lw.moeShGateScalar, hp.nEmb, stream)
+      gpuAdd(tmp0, tmp2, tmp1, hp.nEmb, stream)
 
     if layer < hp.nLayer - 1:
       gpuResidualRmsnorm(xNormPtr, xPtr, tmp0,

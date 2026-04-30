@@ -38,6 +38,11 @@ type
     ssmDtRank*: int
     layerNFfn*: seq[int]
     layerNHeadKv*: seq[int]
+    nExperts*: int
+    nExpertsUsed*: int
+    expertFfnDim*: int
+    fullAttnInterval*: int
+    ropeDimSections*: seq[int32]
 
   Model* = object
     hparams*: HParams
@@ -134,13 +139,21 @@ proc loadHParams(g: GgufFile): HParams =
   if g.getKvU32(prefix & "ssm.group_count", v): result.ssmGroupCount = int(v)
   if g.getKvU32(prefix & "ssm.inner_size", v): result.ssmInnerSize = int(v)
   if g.getKvU32(prefix & "ssm.time_step_rank", v): result.ssmDtRank = int(v)
+  if g.getKvU32(prefix & "expert_count", v): result.nExperts = int(v)
+  if g.getKvU32(prefix & "expert_used_count", v): result.nExpertsUsed = int(v)
+  if g.getKvU32(prefix & "expert_feed_forward_length", v): result.expertFfnDim = int(v)
+  if g.getKvU32(prefix & "full_attention_interval", v): result.fullAttnInterval = int(v)
   var arrI32: seq[int32]
   if g.getKvArrI32(prefix & "feed_forward_length", arrI32):
     result.layerNFfn = arrI32.mapIt(int(it))
   if g.getKvArrI32(prefix & "attention.head_count_kv", arrI32):
     result.layerNHeadKv = arrI32.mapIt(int(it))
+  if g.getKvArrI32(prefix & "rope.dimension_sections", arrI32):
+    result.ropeDimSections = arrI32
   if result.headDim == 0 and result.nHead > 0 and result.nEmb > 0:
     result.headDim = result.nEmb div result.nHead
+  if result.arch == "qwen35moe" and result.ssmGroupCount == 0 and result.ssmStateSize > 0:
+    result.ssmGroupCount = result.ssmDtRank  # preliminary, may be corrected after tensor load
   if result.ropeFreqBase == 0.0'f32:
     result.ropeFreqBase = 10000.0'f32
   if result.ropeDim == 0:
@@ -158,6 +171,13 @@ proc loadModel*(path: string): Model =
   result.cache = initTable[string, Tensor]()
   for info in result.gguf.tensors:
     result.infos[info.name] = info
+  # Derive ssmGroupCount from tensor shapes for qwen35moe (Delta Net nKHeads)
+  if result.hparams.arch == "qwen35moe" and result.hparams.ssmInnerSize > 0:
+    if result.infos.hasKey("blk.0.ssm_conv1d.weight"):
+      let convInfo = result.infos["blk.0.ssm_conv1d.weight"]
+      let convDim = int(convInfo.ne[1])  # [kernelSize, convDim]
+      let nKHeads = (convDim - result.hparams.ssmInnerSize) div (2 * result.hparams.ssmStateSize)
+      result.hparams.ssmGroupCount = nKHeads
 
 proc close*(m: var Model) =
   ## Close the underlying GGUF memory-mapped file.

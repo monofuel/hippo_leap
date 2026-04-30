@@ -15,6 +15,8 @@ type
     lkAttention
     lkFfnOnly
     lkSsm
+    lkSsmAttnMoe
+    lkAttnMoe
 
   GpuTensor* = object
     devicePtr*: pointer
@@ -71,6 +73,28 @@ type
     ssmNorm*: pointer
     layerNFfn*: int
     layerNHeadKv*: int
+    # Fused QKV (qwen3.6)
+    wqkvQ*: pointer
+    wqkvQType*: int32
+    # SSM gate projection (qwen3.6 Delta Net: nEmb → ssmInnerSize)
+    ssmGateQ*: pointer
+    ssmGateQType*: int32
+    # Post-attention norm (qwen3.6)
+    postAttnNorm*: pointer
+    # MoE router + experts
+    moeRouterW*: pointer
+    moeGateExpsQ*: pointer
+    moeUpExpsQ*: pointer
+    moeDownExpsQ*: pointer
+    moeGateExpsQType*, moeUpExpsQType*, moeDownExpsQType*: int32
+    moeGateExpsSliceBytes*, moeUpExpsSliceBytes*, moeDownExpsSliceBytes*: int
+    # Shared expert
+    moeShGateQ*, moeShUpQ*, moeShDownQ*: pointer
+    moeShGateQType*, moeShUpQType*, moeShDownQType*: int32
+    moeShGateScalar*: pointer
+    # Qwen3.6 SSM (alpha/beta formulation)
+    ssmAlphaQ*, ssmBetaQ*: pointer
+    ssmAlphaQType*, ssmBetaQType*: int32
 
   ModelGpuPtrs* = object
     layers*: seq[LayerGpuPtrs]
@@ -91,6 +115,7 @@ type
     scratch0*: GpuTensor
     scratch1*: GpuTensor
     scratch2*: GpuTensor
+    scratch3*: GpuTensor
     scratchCapBytes*: int
     argmaxScratch*: GpuTensor
     argmaxResult*: GpuTensor
