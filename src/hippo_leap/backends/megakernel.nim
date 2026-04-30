@@ -68,10 +68,18 @@ var
   mkInitialized: bool
   mkWeightAllocs: seq[HippoAllocRef]
   mkBufAllocs: seq[HippoAllocRef]
+  devWeightsPtr: pointer
+  devBufsPtr: pointer
 
 # ---------------------------------------------------------------------------
 # Q2K constants
 # ---------------------------------------------------------------------------
+
+proc gridSync() {.importcpp: """
+  do {
+    cooperative_groups::grid_group __hl_grid = cooperative_groups::this_grid();
+    __hl_grid.sync();
+  } while(0)""", header: "hip/hip_cooperative_groups.h", nodecl, used.}
 
 const
   QK_K = 256
@@ -408,6 +416,389 @@ proc siluMulKernel(gate: ptr cfloat, up: ptr cfloat,
     g[tid] = (x / (1.0f + expf(-x))) * u[tid]
 
 # ---------------------------------------------------------------------------
+# Device-side phase functions for persistent cooperative kernel
+# ---------------------------------------------------------------------------
+# Grid is fixed at NumBlocks × BlockSize (16 × 256 = 4096 threads).
+# No grid sync inside phase functions — the persistent kernel manages barriers.
+
+proc embeddingPhase(dst: ptr cfloat, weight: ptr cfloat,
+                    tokenId: cint, nEmb: cint) {.hippoDevice, used.} =
+  let globalTid = cint(blockIdx.x) * cint(blockDim.x) + cint(threadIdx.x)
+  let stride = cint(gridDim.x) * cint(blockDim.x)
+  let w = cast[ptr UncheckedArray[cfloat]](weight)
+  let d = cast[ptr UncheckedArray[cfloat]](dst)
+  var i = globalTid
+  while i < nEmb:
+    d[i] = w[tokenId * nEmb + i]
+    i = i + stride
+
+proc rmsnormPhase(dst: ptr cfloat, src: ptr cfloat, weight: ptr cfloat,
+                  dim: cint, eps: cfloat) {.hippoDevice, used.} =
+  if blockIdx.x != 0'u32: return
+  var sdata {.hippoShared.}: array[BlockSize, cfloat]
+  let tid = cint(threadIdx.x)
+  let s = cast[ptr UncheckedArray[cfloat]](src)
+  let d = cast[ptr UncheckedArray[cfloat]](dst)
+  let wt = cast[ptr UncheckedArray[cfloat]](weight)
+  var sumSq: cfloat = 0.0
+  var i = tid
+  while i < dim:
+    sumSq = sumSq + s[i] * s[i]
+    i = i + cint(blockDim.x)
+  sdata[tid] = sumSq
+  hippoSyncthreads()
+  var stride = cint(blockDim.x) div 2
+  while stride > 0:
+    if tid < stride:
+      sdata[tid] = sdata[tid] + sdata[tid + stride]
+    hippoSyncthreads()
+    stride = stride div 2
+  let rms = 1.0f / sqrtf(sdata[0] / cfloat(dim) + eps)
+  i = tid
+  while i < dim:
+    d[i] = wt[i] * s[i] * rms
+    i = i + cint(blockDim.x)
+
+proc addPhase(dst: ptr cfloat, src: ptr cfloat, dim: cint) {.hippoDevice, used.} =
+  let globalTid = cint(blockIdx.x) * cint(blockDim.x) + cint(threadIdx.x)
+  let stride = cint(gridDim.x) * cint(blockDim.x)
+  let d = cast[ptr UncheckedArray[cfloat]](dst)
+  let s = cast[ptr UncheckedArray[cfloat]](src)
+  var i = globalTid
+  while i < dim:
+    d[i] = d[i] + s[i]
+    i = i + stride
+
+proc linearQ2KPhase(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
+                    inDim: cint, outDim: cint) {.hippoDevice, used.} =
+  let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
+  let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
+  let globalWarpId = cint(blockIdx.x) * cint(WarpsPerBlock) + warpId
+  let wArr = cast[ptr UncheckedArray[uint8]](w)
+  let xArr = cast[ptr UncheckedArray[cfloat]](x)
+  let outArr = cast[ptr UncheckedArray[cfloat]](dst)
+  let nBlocksPerRow = inDim div cint(QK_K)
+  let rowSizeBytes = nBlocksPerRow * cint(BlockQ2KSize)
+  let sub = (laneId shr 4'i32) and 1'i32
+  let qsOff0 = 16'i32 + sub * 16'i32 + (laneId and 15'i32)
+  let qsOff1 = 48'i32 + sub * 16'i32 + (laneId and 15'i32)
+  var row = globalWarpId
+  while row < outDim:
+    let rowBase = row * rowSizeBytes
+    var acc: cfloat = 0.0
+    var blkIdx: cint = 0
+    while blkIdx < nBlocksPerRow:
+      let bs = rowBase + blkIdx * cint(BlockQ2KSize)
+      let eb = blkIdx * cint(QK_K)
+      let dRaw = uint16(wArr[bs + 80'i32]) or (uint16(wArr[bs + 81'i32]) shl 8)
+      let dmRaw = uint16(wArr[bs + 82'i32]) or (uint16(wArr[bs + 83'i32]) shl 8)
+      let d = hippoHalfToFloat(dRaw)
+      let dm = hippoHalfToFloat(dmRaw)
+      let qb0 = wArr[bs + qsOff0]
+      let qb1 = wArr[bs + qsOff1]
+      let sc0 = wArr[bs + sub]
+      acc = acc + (d * cfloat(sc0 and 0x0F'u8) * cfloat(qb0 and 3'u8) - dm * cfloat(sc0 shr 4)) * xArr[eb + laneId]
+      let sc1 = wArr[bs + 2'i32 + sub]
+      acc = acc + (d * cfloat(sc1 and 0x0F'u8) * cfloat((qb0 shr 2) and 3'u8) - dm * cfloat(sc1 shr 4)) * xArr[eb + laneId + 32'i32]
+      let sc2 = wArr[bs + 4'i32 + sub]
+      acc = acc + (d * cfloat(sc2 and 0x0F'u8) * cfloat((qb0 shr 4) and 3'u8) - dm * cfloat(sc2 shr 4)) * xArr[eb + laneId + 64'i32]
+      let sc3 = wArr[bs + 6'i32 + sub]
+      acc = acc + (d * cfloat(sc3 and 0x0F'u8) * cfloat((qb0 shr 6) and 3'u8) - dm * cfloat(sc3 shr 4)) * xArr[eb + laneId + 96'i32]
+      let sc4 = wArr[bs + 8'i32 + sub]
+      acc = acc + (d * cfloat(sc4 and 0x0F'u8) * cfloat(qb1 and 3'u8) - dm * cfloat(sc4 shr 4)) * xArr[eb + laneId + 128'i32]
+      let sc5 = wArr[bs + 10'i32 + sub]
+      acc = acc + (d * cfloat(sc5 and 0x0F'u8) * cfloat((qb1 shr 2) and 3'u8) - dm * cfloat(sc5 shr 4)) * xArr[eb + laneId + 160'i32]
+      let sc6 = wArr[bs + 12'i32 + sub]
+      acc = acc + (d * cfloat(sc6 and 0x0F'u8) * cfloat((qb1 shr 4) and 3'u8) - dm * cfloat(sc6 shr 4)) * xArr[eb + laneId + 192'i32]
+      let sc7 = wArr[bs + 14'i32 + sub]
+      acc = acc + (d * cfloat(sc7 and 0x0F'u8) * cfloat((qb1 shr 6) and 3'u8) - dm * cfloat(sc7 shr 4)) * xArr[eb + laneId + 224'i32]
+      blkIdx = blkIdx + 1'i32
+    acc = acc + hippoShflDown(acc, 16)
+    acc = acc + hippoShflDown(acc, 8)
+    acc = acc + hippoShflDown(acc, 4)
+    acc = acc + hippoShflDown(acc, 2)
+    acc = acc + hippoShflDown(acc, 1)
+    if laneId == 0'i32:
+      outArr[row] = acc
+    row = row + cint(TotalWarps)
+
+proc linearQ3KPhase(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
+                    inDim: cint, outDim: cint) {.hippoDevice, used.} =
+  let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
+  let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
+  let globalWarpId = cint(blockIdx.x) * cint(WarpsPerBlock) + warpId
+  let wArr = cast[ptr UncheckedArray[uint8]](w)
+  let xArr = cast[ptr UncheckedArray[cfloat]](x)
+  let outArr = cast[ptr UncheckedArray[cfloat]](dst)
+  let nBlocksPerRow = inDim div 256'i32
+  let rowSizeBytes = nBlocksPerRow * 110'i32
+  let sub = (laneId shr 4'i32) and 1'i32
+  let qsOff0 = 32'i32 + sub * 16'i32 + (laneId and 15'i32)
+  let qsOff1 = 64'i32 + sub * 16'i32 + (laneId and 15'i32)
+  let hmOff = sub * 16'i32 + (laneId and 15'i32)
+  var row = globalWarpId
+  while row < outDim:
+    let rowBase = row * rowSizeBytes
+    var acc: cfloat = 0.0
+    var blkIdx: cint = 0
+    while blkIdx < nBlocksPerRow:
+      let bs = rowBase + blkIdx * 110'i32
+      let eb = blkIdx * 256'i32
+      let dRaw = uint16(wArr[bs + 108'i32]) or (uint16(wArr[bs + 109'i32]) shl 8)
+      let dAll = hippoHalfToFloat(dRaw)
+      let qb0 = wArr[bs + qsOff0]
+      let qb1 = wArr[bs + qsOff1]
+      let hmByte = cint(wArr[bs + hmOff])
+      template q3kElem(scaleIdx: cint, qByte: untyped, qShift, hmBitPos, xOff: cint) {.dirty.} =
+        block:
+          let si = scaleIdx
+          let big = si and 3'i32
+          let ai = si shr 2'i32
+          let sByteVal = cint(wArr[bs + 96'i32 + (ai and 1'i32) * 4'i32 + big])
+          let tByteVal = cint(wArr[bs + 104'i32 + big])
+          let low = (sByteVal shr ((ai shr 1'i32) * 4'i32)) and 0x0F'i32
+          let high = ((tByteVal shr (ai * 2'i32)) and 0x03'i32) shl 4'i32
+          let scByte = low or high
+          let scSigned = (scByte xor 0x80'i32) - 0x80'i32
+          let dl = dAll * cfloat(scSigned - 32'i32)
+          let qval = cint((qByte shr qShift) and 3)
+          let hm = 4'i32 - ((hmByte shr hmBitPos) and 1'i32) * 4'i32
+          acc = acc + dl * cfloat(qval - hm) * xArr[eb + xOff]
+      q3kElem(sub,            qb0, 0, 0, laneId)
+      q3kElem(2'i32 + sub,    qb0, 2, 1, laneId + 32'i32)
+      q3kElem(4'i32 + sub,    qb0, 4, 2, laneId + 64'i32)
+      q3kElem(6'i32 + sub,    qb0, 6, 3, laneId + 96'i32)
+      q3kElem(8'i32 + sub,    qb1, 0, 4, laneId + 128'i32)
+      q3kElem(10'i32 + sub,   qb1, 2, 5, laneId + 160'i32)
+      q3kElem(12'i32 + sub,   qb1, 4, 6, laneId + 192'i32)
+      q3kElem(14'i32 + sub,   qb1, 6, 7, laneId + 224'i32)
+      blkIdx = blkIdx + 1'i32
+    acc = acc + hippoShflDown(acc, 16)
+    acc = acc + hippoShflDown(acc, 8)
+    acc = acc + hippoShflDown(acc, 4)
+    acc = acc + hippoShflDown(acc, 2)
+    acc = acc + hippoShflDown(acc, 1)
+    if laneId == 0'i32:
+      outArr[row] = acc
+    row = row + cint(TotalWarps)
+
+proc linearF32Phase(dst: ptr cfloat, x: ptr cfloat, w: ptr cfloat,
+                    inDim: cint, outDim: cint) {.hippoDevice, used.} =
+  let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
+  let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
+  let globalWarpId = cint(blockIdx.x) * cint(WarpsPerBlock) + warpId
+  let wArr = cast[ptr UncheckedArray[cfloat]](w)
+  let xArr = cast[ptr UncheckedArray[cfloat]](x)
+  let outArr = cast[ptr UncheckedArray[cfloat]](dst)
+  var row = globalWarpId
+  while row < outDim:
+    var acc: cfloat = 0.0
+    var i = laneId
+    while i < inDim:
+      acc = acc + wArr[row * inDim + i] * xArr[i]
+      i = i + cint(mkc.WarpSize)
+    acc = acc + hippoShflDown(acc, 16)
+    acc = acc + hippoShflDown(acc, 8)
+    acc = acc + hippoShflDown(acc, 4)
+    acc = acc + hippoShflDown(acc, 2)
+    acc = acc + hippoShflDown(acc, 1)
+    if laneId == 0'i32:
+      outArr[row] = acc
+    row = row + cint(TotalWarps)
+
+proc linearPhase(dst: ptr cfloat, x: ptr cfloat, w: MkWeight,
+                 inDim: cint, outDim: cint) {.hippoDevice, used.} =
+  if w.qtype == 10'i32:
+    linearQ2KPhase(dst, x, cast[ptr uint8](w.p), inDim, outDim)
+  elif w.qtype == 11'i32:
+    linearQ3KPhase(dst, x, cast[ptr uint8](w.p), inDim, outDim)
+  elif w.qtype == 0'i32:
+    linearF32Phase(dst, x, cast[ptr cfloat](w.p), inDim, outDim)
+
+proc ropePhase(q: ptr cfloat, k: ptr cfloat, theta: ptr cfloat,
+               nHeadQ: cint, nHeadK: cint, headDim: cint,
+               ropeDim: cint, pos: cint) {.hippoDevice, used.} =
+  let globalTid = cint(blockIdx.x) * cint(blockDim.x) + cint(threadIdx.x)
+  let stride = cint(gridDim.x) * cint(blockDim.x)
+  let halfRope = ropeDim div 2
+  let totalPairs = (nHeadQ + nHeadK) * halfRope
+  let thetaArr = cast[ptr UncheckedArray[cfloat]](theta)
+  var tid = globalTid
+  while tid < totalPairs:
+    let isK = tid >= nHeadQ * halfRope
+    let head = if isK: (tid - nHeadQ * halfRope) div halfRope
+               else: tid div halfRope
+    let pairIdx = if isK: (tid - nHeadQ * halfRope) mod halfRope
+                  else: tid mod halfRope
+    let basePtr = if isK: cast[ptr UncheckedArray[cfloat]](k)
+                  else: cast[ptr UncheckedArray[cfloat]](q)
+    let offset = head * headDim + pairIdx
+    let freq = thetaArr[pairIdx] * cfloat(pos)
+    let cosVal = cosf(freq)
+    let sinVal = sinf(freq)
+    let v0 = basePtr[offset]
+    let v1 = basePtr[offset + halfRope]
+    basePtr[offset] = v0 * cosVal - v1 * sinVal
+    basePtr[offset + halfRope] = v0 * sinVal + v1 * cosVal
+    tid = tid + stride
+
+proc storeKVPhase(kCache: ptr cfloat, kSrc: ptr cfloat,
+                  vCache: ptr cfloat, vSrc: ptr cfloat,
+                  kvDim: cint, cacheCols: cint, pos: cint) {.hippoDevice, used.} =
+  let globalTid = cint(blockIdx.x) * cint(blockDim.x) + cint(threadIdx.x)
+  let stride = cint(gridDim.x) * cint(blockDim.x)
+  let kc = cast[ptr UncheckedArray[cfloat]](kCache)
+  let vc = cast[ptr UncheckedArray[cfloat]](vCache)
+  let ks = cast[ptr UncheckedArray[cfloat]](kSrc)
+  let vs = cast[ptr UncheckedArray[cfloat]](vSrc)
+  var i = globalTid
+  while i < kvDim:
+    kc[i * cacheCols + pos] = ks[i]
+    vc[i * cacheCols + pos] = vs[i]
+    i = i + stride
+
+proc attentionPhase(dst: ptr cfloat, q: ptr cfloat,
+                    kCache: ptr cfloat, vCache: ptr cfloat,
+                    nHead: cint, nHeadKv: cint, headDim: cint,
+                    curLen: cint, cacheCols: cint) {.hippoDevice, used.} =
+  let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
+  let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
+  let globalWarpId = cint(blockIdx.x) * cint(WarpsPerBlock) + warpId
+  let head = globalWarpId
+  if head >= nHead: return
+  if laneId != 0: return
+  let qArr = cast[ptr UncheckedArray[cfloat]](q)
+  let kArr = cast[ptr UncheckedArray[cfloat]](kCache)
+  let vArr = cast[ptr UncheckedArray[cfloat]](vCache)
+  let dArr = cast[ptr UncheckedArray[cfloat]](dst)
+  let qOff = head * headDim
+  let kvHead = head div (nHead div nHeadKv)
+  let kvOff = kvHead * headDim
+  let scale = 1.0f / sqrtf(cfloat(headDim))
+  var mS: cfloat = -1e30f
+  var sE: cfloat = 0.0f
+  {.emit: "float __attn_acc[64];".}
+  {.emit: "for (int __i = 0; __i < 64; __i++) __attn_acc[__i] = 0.0f;".}
+  var p: cint = 0
+  while p < curLen:
+    var sc: cfloat = 0.0f
+    var dd: cint = 0
+    while dd < headDim:
+      sc = sc + qArr[qOff + dd] * kArr[(kvOff + dd) * cacheCols + p]
+      dd = dd + 1
+    sc = sc * scale
+    if sc > mS:
+      let corr = expf(mS - sc)
+      sE = sE * corr + 1.0f
+      {.emit: """
+      for (int __i = 0; __i < `headDim`; __i++)
+        __attn_acc[__i] = __attn_acc[__i] * `corr` + ((float*)(`vArr`))[((`kvOff` + __i) * `cacheCols` + `p`)];
+      """.}
+      mS = sc
+    else:
+      let w = expf(sc - mS)
+      sE = sE + w
+      {.emit: """
+      for (int __i = 0; __i < `headDim`; __i++)
+        __attn_acc[__i] += `w` * ((float*)(`vArr`))[((`kvOff` + __i) * `cacheCols` + `p`)];
+      """.}
+    p = p + 1
+  let invSum = 1.0f / sE
+  {.emit: """
+  for (int __i = 0; __i < `headDim`; __i++)
+    ((float*)(`dArr`))[`qOff` + __i] = __attn_acc[__i] * `invSum`;
+  """.}
+
+proc siluMulPhase(gate: ptr cfloat, up: ptr cfloat, dim: cint) {.hippoDevice, used.} =
+  let globalTid = cint(blockIdx.x) * cint(blockDim.x) + cint(threadIdx.x)
+  let stride = cint(gridDim.x) * cint(blockDim.x)
+  let g = cast[ptr UncheckedArray[cfloat]](gate)
+  let u = cast[ptr UncheckedArray[cfloat]](up)
+  var i = globalTid
+  while i < dim:
+    let x = g[i]
+    g[i] = (x / (1.0f + expf(-x))) * u[i]
+    i = i + stride
+
+# ---------------------------------------------------------------------------
+# Persistent cooperative kernel
+# ---------------------------------------------------------------------------
+
+proc megakernelDecode(
+  weights: ptr MkModelWeights, bufs: ptr MkBuffers,
+  tokenId: cint, curLen: cint, cacheCols: cint
+) {.hippoGlobal.} =
+  let act0 = cast[ptr cfloat](bufs.act0)
+  let act1 = cast[ptr cfloat](bufs.act1)
+  let s0 = cast[ptr cfloat](bufs.scratch0)
+  let s1 = cast[ptr cfloat](bufs.scratch1)
+  let s2 = cast[ptr cfloat](bufs.scratch2)
+  let logitsP = cast[ptr cfloat](bufs.logits)
+  let nEmb = cint(ModelCfg.nEmb)
+  let eps = cfloat(ModelCfg.rmsEps)
+
+  embeddingPhase(act0, cast[ptr cfloat](weights.tokEmb), tokenId, nEmb)
+  gridSync()
+
+  rmsnormPhase(act1, act0, cast[ptr cfloat](weights.layers[0].attnNorm), nEmb, eps)
+  gridSync()
+
+  var layer: cint = 0
+  while layer < cint(ModelCfg.nLayers):
+    let lw = weights.layers[layer]
+    let kvK = cast[ptr cfloat](bufs.kvK[layer])
+    let kvV = cast[ptr cfloat](bufs.kvV[layer])
+
+    linearPhase(s0, act1, lw.wq, nEmb, cint(QDim))
+    linearPhase(s1, act1, lw.wk, nEmb, cint(KvDim))
+    linearPhase(s2, act1, lw.wv, nEmb, cint(KvDim))
+    gridSync()
+
+    ropePhase(s0, s1, cast[ptr cfloat](weights.ropeTheta),
+              cint(ModelCfg.nHead), cint(ModelCfg.nHeadKv), cint(ModelCfg.headDim),
+              cint(ModelCfg.ropeDim), curLen)
+    storeKVPhase(kvK, s1, kvV, s2, cint(KvDim), cacheCols, curLen)
+    gridSync()
+
+    attentionPhase(s1, s0, kvK, kvV,
+                   cint(ModelCfg.nHead), cint(ModelCfg.nHeadKv), cint(ModelCfg.headDim),
+                   curLen + 1, cacheCols)
+    gridSync()
+
+    linearPhase(s0, s1, lw.wo, cint(QDim), nEmb)
+    gridSync()
+
+    addPhase(act0, s0, nEmb)
+    gridSync()
+
+    rmsnormPhase(act1, act0, cast[ptr cfloat](lw.ffnNorm), nEmb, eps)
+    gridSync()
+
+    linearPhase(s0, act1, lw.wGate, nEmb, cint(ModelCfg.ffnDim))
+    linearPhase(s1, act1, lw.wUp, nEmb, cint(ModelCfg.ffnDim))
+    gridSync()
+
+    siluMulPhase(s0, s1, cint(ModelCfg.ffnDim))
+    gridSync()
+
+    linearPhase(s1, s0, lw.wDown, cint(ModelCfg.ffnDim), nEmb)
+    gridSync()
+
+    addPhase(act0, s1, nEmb)
+    gridSync()
+
+    if layer < cint(ModelCfg.nLayers) - 1:
+      rmsnormPhase(act1, act0,
+                   cast[ptr cfloat](weights.layers[layer + 1].attnNorm), nEmb, eps)
+      gridSync()
+
+    layer = layer + 1
+
+  rmsnormPhase(act1, act0, cast[ptr cfloat](weights.outputNorm), nEmb, eps)
+  gridSync()
+  linearPhase(logitsP, act1, weights.outputWeight, nEmb, cint(ModelCfg.nVocab))
+
+# ---------------------------------------------------------------------------
 # Host-side dispatch helpers
 # ---------------------------------------------------------------------------
 
@@ -705,6 +1096,18 @@ proc loadModelBackend*(m: var Model, hp: HParams) =
     mkBuf.kvV[layer] = vAlloc.p
 
   hippoStreamSynchronize(mkStream)
+
+  # Upload weight/buffer structs to device for persistent kernel
+  let wStructAlloc = hippoMalloc(sizeof(MkModelWeights))
+  hippoMemcpy(wStructAlloc.p, addr mkWeights, sizeof(MkModelWeights), HippoMemcpyHostToDevice)
+  mkBufAllocs.add(wStructAlloc)
+  devWeightsPtr = wStructAlloc.p
+
+  let bStructAlloc = hippoMalloc(sizeof(MkBuffers))
+  hippoMemcpy(bStructAlloc.p, addr mkBuf, sizeof(MkBuffers), HippoMemcpyHostToDevice)
+  mkBufAllocs.add(bStructAlloc)
+  devBufsPtr = bStructAlloc.p
+
   mkInitialized = true
   echo &"[megakernel] Loaded {ModelCfg.nLayers} layers, nEmb={ModelCfg.nEmb}, Q2K"
   echo &"[megakernel] Machine: {Machine.hostname}, {Machine.gpu.cuCount} CU"
@@ -720,7 +1123,23 @@ proc unloadModelBackend*() =
 # Forward decode (individual kernel launches — correctness path)
 # ---------------------------------------------------------------------------
 
-proc forwardDecodeInternal(token: int32, curLen: int): seq[float32] =
+proc forwardDecodeCooperative(token: int32, curLen: int): seq[float32] =
+  var wp = devWeightsPtr
+  var bp = devBufsPtr
+  var tid = cint(token)
+  var cLen = cint(curLen)
+  var cc = cint(mkMaxLen)
+  hippoLaunchCooperative(megakernelDecode,
+    gridDim = newDim3(NumBlocks.uint32),
+    blockDim = newDim3(BlockSize.uint32),
+    stream = mkStream,
+    args = hippoArgs(wp, bp, tid, cLen, cc))
+  hippoStreamSynchronize(mkStream)
+  result = newSeq[float32](ModelCfg.nVocab)
+  hippoMemcpy(addr result[0], mkBuf.logits, ModelCfg.nVocab * sizeof(float32),
+              HippoMemcpyDeviceToHost)
+
+proc forwardDecodeIndividual(token: int32, curLen: int): seq[float32] =
   let cacheCols = mkMaxLen
 
   when defined(debugMegakernel):
@@ -768,6 +1187,12 @@ proc forwardDecodeInternal(token: int32, curLen: int): seq[float32] =
 # Backend interface: forward functions
 # ---------------------------------------------------------------------------
 
+proc forwardDecodeInternal(token: int32, curLen: int): seq[float32] =
+  when defined(useIndividualLaunches):
+    forwardDecodeIndividual(token, curLen)
+  else:
+    forwardDecodeCooperative(token, curLen)
+
 proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tensor =
   var logits: seq[float32]
   for i, tok in tokens:
@@ -783,7 +1208,6 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
 proc forwardDecodeToken*(m: var Model, token: int32, cache: var KvCache): int32 =
   let logits = forwardDecodeInternal(token, cache.curLen)
   inc cache.curLen
-  # Argmax
   var maxVal = logits[0]
   result = 0
   for i in 1 ..< logits.len:
