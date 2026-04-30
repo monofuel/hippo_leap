@@ -331,12 +331,12 @@ proc attentionDecodeKernel(dst: ptr cfloat, q: ptr cfloat,
                            kCache: ptr cfloat, vCache: ptr cfloat,
                            nHead: cint, nHeadKv: cint, headDim: cint,
                            curLen: cint, cacheCols: cint) {.hippoGlobal.} =
-  ## MVP: thread 0 does sequential online softmax attention per head.
-  ## One block per head, only thread 0 active.
+  ## Warp-per-head attention: 1 block per head, warp 0 (32 lanes) does work.
+  ## headDim=64, lane i handles dims i and i+32.
   let head = cint(blockIdx.x)
   if head >= nHead: return
   let tid = cint(threadIdx.x)
-  if tid != 0: return
+  if tid >= cint(mkc.WarpSize): return
 
   let qArr = cast[ptr UncheckedArray[cfloat]](q)
   let kArr = cast[ptr UncheckedArray[cfloat]](kCache)
@@ -348,41 +348,41 @@ proc attentionDecodeKernel(dst: ptr cfloat, q: ptr cfloat,
   let kvOff = kvHead * headDim
   let scale = 1.0f / sqrtf(cfloat(headDim))
 
+  let q0 = qArr[qOff + tid]
+  let q1 = qArr[qOff + tid + 32]
+
+  var acc0: cfloat = 0.0
+  var acc1: cfloat = 0.0
   var mS: cfloat = -1e30f
   var sE: cfloat = 0.0f
-  {.emit: "float __attn_acc[64];".}
-  {.emit: "for (int __i = 0; __i < 64; __i++) __attn_acc[__i] = 0.0f;".}
 
   var p: cint = 0
   while p < curLen:
-    var sc: cfloat = 0.0f
-    var dd: cint = 0
-    while dd < headDim:
-      sc = sc + qArr[qOff + dd] * kArr[(kvOff + dd) * cacheCols + p]
-      dd = dd + 1
-    sc = sc * scale
+    var partial = q0 * kArr[(kvOff + tid) * cacheCols + p] +
+                  q1 * kArr[(kvOff + tid + 32) * cacheCols + p]
+    partial = partial + hippoShflDown(partial, 16)
+    partial = partial + hippoShflDown(partial, 8)
+    partial = partial + hippoShflDown(partial, 4)
+    partial = partial + hippoShflDown(partial, 2)
+    partial = partial + hippoShflDown(partial, 1)
+    let sc = hippoShfl(partial, 0) * scale
+
     if sc > mS:
       let corr = expf(mS - sc)
+      acc0 = acc0 * corr + vArr[(kvOff + tid) * cacheCols + p]
+      acc1 = acc1 * corr + vArr[(kvOff + tid + 32) * cacheCols + p]
       sE = sE * corr + 1.0f
-      {.emit: """
-      for (int __i = 0; __i < `headDim`; __i++)
-        __attn_acc[__i] = __attn_acc[__i] * `corr` + ((float*)(`vArr`))[((`kvOff` + __i) * `cacheCols` + `p`)];
-      """.}
       mS = sc
     else:
       let w = expf(sc - mS)
+      acc0 = acc0 + w * vArr[(kvOff + tid) * cacheCols + p]
+      acc1 = acc1 + w * vArr[(kvOff + tid + 32) * cacheCols + p]
       sE = sE + w
-      {.emit: """
-      for (int __i = 0; __i < `headDim`; __i++)
-        __attn_acc[__i] += `w` * ((float*)(`vArr`))[((`kvOff` + __i) * `cacheCols` + `p`)];
-      """.}
     p = p + 1
 
   let invSum = 1.0f / sE
-  {.emit: """
-  for (int __i = 0; __i < `headDim`; __i++)
-    ((float*)(`dArr`))[`qOff` + __i] = __attn_acc[__i] * `invSum`;
-  """.}
+  dArr[qOff + tid] = acc0 * invSum
+  dArr[qOff + tid + 32] = acc1 * invSum
 
 proc linearF32WarpKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr cfloat,
                          inDim: cint, outDim: cint) {.hippoGlobal.} =
@@ -661,53 +661,65 @@ proc attentionPhase(dst: ptr cfloat, q: ptr cfloat,
                     kCache: ptr cfloat, vCache: ptr cfloat,
                     nHead: cint, nHeadKv: cint, headDim: cint,
                     curLen: cint, cacheCols: cint) {.hippoDevice, used.} =
+  ## Warp-per-head attention: 32 lanes × 2 dims each = 64 dims (headDim).
+  ## 128 total warps, 32 heads → each warp handles 1 head (warps 32-127 idle).
   let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
   let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
   let globalWarpId = cint(blockIdx.x) * cint(WarpsPerBlock) + warpId
   let head = globalWarpId
   if head >= nHead: return
-  if laneId != 0: return
+
   let qArr = cast[ptr UncheckedArray[cfloat]](q)
   let kArr = cast[ptr UncheckedArray[cfloat]](kCache)
   let vArr = cast[ptr UncheckedArray[cfloat]](vCache)
   let dArr = cast[ptr UncheckedArray[cfloat]](dst)
+
   let qOff = head * headDim
   let kvHead = head div (nHead div nHeadKv)
   let kvOff = kvHead * headDim
   let scale = 1.0f / sqrtf(cfloat(headDim))
+
+  # Each lane loads its 2 Q values (lane i handles dims i and i+32)
+  let q0 = qArr[qOff + laneId]
+  let q1 = qArr[qOff + laneId + 32]
+
+  # Accumulator for V weighted sum (2 dims per lane)
+  var acc0: cfloat = 0.0
+  var acc1: cfloat = 0.0
   var mS: cfloat = -1e30f
   var sE: cfloat = 0.0f
-  {.emit: "float __attn_acc[64];".}
-  {.emit: "for (int __i = 0; __i < 64; __i++) __attn_acc[__i] = 0.0f;".}
+
   var p: cint = 0
   while p < curLen:
-    var sc: cfloat = 0.0f
-    var dd: cint = 0
-    while dd < headDim:
-      sc = sc + qArr[qOff + dd] * kArr[(kvOff + dd) * cacheCols + p]
-      dd = dd + 1
-    sc = sc * scale
+    # Q·K dot product: each lane computes partial for its 2 dims
+    var partial = q0 * kArr[(kvOff + laneId) * cacheCols + p] +
+                  q1 * kArr[(kvOff + laneId + 32) * cacheCols + p]
+    # Warp reduce to get full dot product
+    partial = partial + hippoShflDown(partial, 16)
+    partial = partial + hippoShflDown(partial, 8)
+    partial = partial + hippoShflDown(partial, 4)
+    partial = partial + hippoShflDown(partial, 2)
+    partial = partial + hippoShflDown(partial, 1)
+    # Broadcast score from lane 0
+    let sc = hippoShfl(partial, 0) * scale
+
+    # Online softmax + V accumulation
     if sc > mS:
       let corr = expf(mS - sc)
+      acc0 = acc0 * corr + vArr[(kvOff + laneId) * cacheCols + p]
+      acc1 = acc1 * corr + vArr[(kvOff + laneId + 32) * cacheCols + p]
       sE = sE * corr + 1.0f
-      {.emit: """
-      for (int __i = 0; __i < `headDim`; __i++)
-        __attn_acc[__i] = __attn_acc[__i] * `corr` + ((float*)(`vArr`))[((`kvOff` + __i) * `cacheCols` + `p`)];
-      """.}
       mS = sc
     else:
       let w = expf(sc - mS)
+      acc0 = acc0 + w * vArr[(kvOff + laneId) * cacheCols + p]
+      acc1 = acc1 + w * vArr[(kvOff + laneId + 32) * cacheCols + p]
       sE = sE + w
-      {.emit: """
-      for (int __i = 0; __i < `headDim`; __i++)
-        __attn_acc[__i] += `w` * ((float*)(`vArr`))[((`kvOff` + __i) * `cacheCols` + `p`)];
-      """.}
     p = p + 1
+
   let invSum = 1.0f / sE
-  {.emit: """
-  for (int __i = 0; __i < `headDim`; __i++)
-    ((float*)(`dArr`))[`qOff` + __i] = __attn_acc[__i] * `invSum`;
-  """.}
+  dArr[qOff + laneId] = acc0 * invSum
+  dArr[qOff + laneId + 32] = acc1 * invSum
 
 proc siluMulPhase(gate: ptr cfloat, up: ptr cfloat, dim: cint) {.hippoDevice, used.} =
   let globalTid = cint(blockIdx.x) * cint(blockDim.x) + cint(threadIdx.x)
@@ -745,13 +757,13 @@ proc megakernelDecode(
 
   var layer: cint = 0
   while layer < cint(ModelCfg.nLayers):
-    let lw = weights.layers[layer]
+    # Access layer weights via pointer — no struct copy (avoids nimZeroMem)
     let kvK = cast[ptr cfloat](bufs.kvK[layer])
     let kvV = cast[ptr cfloat](bufs.kvV[layer])
 
-    linearPhase(s0, act1, lw.wq, nEmb, cint(QDim))
-    linearPhase(s1, act1, lw.wk, nEmb, cint(KvDim))
-    linearPhase(s2, act1, lw.wv, nEmb, cint(KvDim))
+    linearPhase(s0, act1, weights.layers[layer].wq, nEmb, cint(QDim))
+    linearPhase(s1, act1, weights.layers[layer].wk, nEmb, cint(KvDim))
+    linearPhase(s2, act1, weights.layers[layer].wv, nEmb, cint(KvDim))
     gridSync()
 
     ropePhase(s0, s1, cast[ptr cfloat](weights.ropeTheta),
@@ -765,23 +777,23 @@ proc megakernelDecode(
                    curLen + 1, cacheCols)
     gridSync()
 
-    linearPhase(s0, s1, lw.wo, cint(QDim), nEmb)
+    linearPhase(s0, s1, weights.layers[layer].wo, cint(QDim), nEmb)
     gridSync()
 
     addPhase(act0, s0, nEmb)
     gridSync()
 
-    rmsnormPhase(act1, act0, cast[ptr cfloat](lw.ffnNorm), nEmb, eps)
+    rmsnormPhase(act1, act0, cast[ptr cfloat](weights.layers[layer].ffnNorm), nEmb, eps)
     gridSync()
 
-    linearPhase(s0, act1, lw.wGate, nEmb, cint(ModelCfg.ffnDim))
-    linearPhase(s1, act1, lw.wUp, nEmb, cint(ModelCfg.ffnDim))
+    linearPhase(s0, act1, weights.layers[layer].wGate, nEmb, cint(ModelCfg.ffnDim))
+    linearPhase(s1, act1, weights.layers[layer].wUp, nEmb, cint(ModelCfg.ffnDim))
     gridSync()
 
     siluMulPhase(s0, s1, cint(ModelCfg.ffnDim))
     gridSync()
 
-    linearPhase(s1, s0, lw.wDown, cint(ModelCfg.ffnDim), nEmb)
+    linearPhase(s1, s0, weights.layers[layer].wDown, cint(ModelCfg.ffnDim), nEmb)
     gridSync()
 
     addPhase(act0, s1, nEmb)
@@ -1123,21 +1135,22 @@ proc unloadModelBackend*() =
 # Forward decode (individual kernel launches — correctness path)
 # ---------------------------------------------------------------------------
 
-proc forwardDecodeCooperative(token: int32, curLen: int): seq[float32] =
-  var wp = devWeightsPtr
-  var bp = devBufsPtr
-  var tid = cint(token)
-  var cLen = cint(curLen)
-  var cc = cint(mkMaxLen)
-  hippoLaunchCooperative(megakernelDecode,
-    gridDim = newDim3(NumBlocks.uint32),
-    blockDim = newDim3(BlockSize.uint32),
-    stream = mkStream,
-    args = hippoArgs(wp, bp, tid, cLen, cc))
-  hippoStreamSynchronize(mkStream)
-  result = newSeq[float32](ModelCfg.nVocab)
-  hippoMemcpy(addr result[0], mkBuf.logits, ModelCfg.nVocab * sizeof(float32),
-              HippoMemcpyDeviceToHost)
+when not defined(useIndividualLaunches):
+  proc forwardDecodeCooperative(token: int32, curLen: int): seq[float32] =
+    var wp = devWeightsPtr
+    var bp = devBufsPtr
+    var tid = cint(token)
+    var cLen = cint(curLen)
+    var cc = cint(mkMaxLen)
+    hippoLaunchCooperative(megakernelDecode,
+      gridDim = newDim3(NumBlocks.uint32),
+      blockDim = newDim3(BlockSize.uint32),
+      stream = mkStream,
+      args = hippoArgs(wp, bp, tid, cLen, cc))
+    hippoStreamSynchronize(mkStream)
+    result = newSeq[float32](ModelCfg.nVocab)
+    hippoMemcpy(addr result[0], mkBuf.logits, ModelCfg.nVocab * sizeof(float32),
+                HippoMemcpyDeviceToHost)
 
 proc forwardDecodeIndividual(token: int32, curLen: int): seq[float32] =
   let cacheCols = mkMaxLen

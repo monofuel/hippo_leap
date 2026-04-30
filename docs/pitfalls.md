@@ -17,16 +17,27 @@ overloads for numeric types inside `{.hippoGlobal.}` and
 `{.hippoDevice.}` proc bodies, or inject them automatically during
 the macro transform.
 
-## 2. No array initialization (generates `nimZeroMem`)
+## 2. Struct copies and array init generate `nimZeroMem`
 
 Declaring `var arr: array[64, cfloat]` inside a kernel emits a call to
 `nimZeroMem`, which is a host-only Nim runtime function. This causes
 either a link error or a runtime crash.
 
-**Workaround**: Use `{.emit.}` to declare and zero-fill C arrays:
+The same applies to **struct copies**: `let lw = weights.layers[i]`
+copies an `object` type, which Nim zero-initializes the destination
+first via `nimZeroMem`. Access struct fields directly through the
+original variable instead of copying.
+
+**Workaround for arrays**: Use `{.emit.}` to declare and zero-fill C arrays:
 ```nim
 {.emit: "float __attn_acc[64];".}
 {.emit: "for (int __i = 0; __i < 64; __i++) __attn_acc[__i] = 0.0f;".}
+```
+
+**Workaround for structs**: Don't copy — access through the original:
+```nim
+# BAD: let lw = weights.layers[layer]  # nimZeroMem!
+# GOOD: weights.layers[layer].wq       # direct field access
 ```
 
 **Hippo improvement**: Intercept `nimZeroMem` calls inside GPU proc
