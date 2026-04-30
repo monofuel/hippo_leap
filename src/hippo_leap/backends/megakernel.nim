@@ -165,7 +165,7 @@ proc addKernel(dst: ptr cfloat, src: ptr cfloat, dim: cint) {.hippoGlobal.} =
 
 proc linearQ2KWarpKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
                          inDim: cint, outDim: cint) {.hippoGlobal.} =
-  ## Warp-per-row Q2K GEMV. Matches naive backend's proven-correct layout:
+  ## Warp-per-row Q2K GEMV.
   ## Q2K block = [scales:16][qs:64][d:2][dmin:2] = 84 bytes.
   let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
   let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
@@ -223,7 +223,7 @@ proc linearQ2KWarpKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
 
 proc linearQ3KWarpKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
                          inDim: cint, outDim: cint) {.hippoGlobal.} =
-  ## Warp-per-row Q3_K GEMV. Ported from naive backend's proven-correct kernel.
+  ## Warp-per-row Q3_K GEMV.
   let tid = cint(threadIdx.x)
   let row = cint(blockIdx.x)
   if row >= outDim: return
@@ -404,6 +404,38 @@ proc linearF32WarpKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr cfloat,
   acc = acc + hippoShflDown(acc, 2)
   acc = acc + hippoShflDown(acc, 1)
   if tid == 0'i32:
+    outArr[row] = acc
+
+proc linearQ8_0WarpKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
+                          inDim: cint, outDim: cint) {.hippoGlobal.} =
+  ## Warp-per-row Q8_0 GEMV.
+  let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
+  let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
+  let warpsPerBlock = cint(blockDim.x) div cint(mkc.WarpSize)
+  let row = cint(blockIdx.x) * warpsPerBlock + warpId
+  if row >= outDim: return
+  let wArr = cast[ptr UncheckedArray[uint8]](w)
+  let xArr = cast[ptr UncheckedArray[cfloat]](x)
+  let outArr = cast[ptr UncheckedArray[cfloat]](dst)
+  let nBlocksPerRow = inDim div 32'i32
+  let rowSizeBytes = nBlocksPerRow * cint(BlockQ8_0Size)
+  let rowBase = row * rowSizeBytes
+  var acc: cfloat = 0.0
+  var blkIdx: cint = 0
+  while blkIdx < nBlocksPerRow:
+    let bs = rowBase + blkIdx * cint(BlockQ8_0Size)
+    let eb = blkIdx * 32'i32
+    let dRaw = uint16(wArr[bs]) or (uint16(wArr[bs + 1'i32]) shl 8)
+    let d = hippoHalfToFloat(dRaw)
+    let qVal = cast[int8](wArr[bs + 2'i32 + laneId])
+    acc = acc + d * cfloat(qVal) * xArr[eb + laneId]
+    blkIdx = blkIdx + 1'i32
+  acc = acc + hippoShflDown(acc, 16)
+  acc = acc + hippoShflDown(acc, 8)
+  acc = acc + hippoShflDown(acc, 4)
+  acc = acc + hippoShflDown(acc, 2)
+  acc = acc + hippoShflDown(acc, 1)
+  if laneId == 0'i32:
     outArr[row] = acc
 
 proc siluMulKernel(gate: ptr cfloat, up: ptr cfloat,
@@ -606,6 +638,38 @@ proc linearF32Phase(dst: ptr cfloat, x: ptr cfloat, w: ptr cfloat,
       outArr[row] = acc
     row = row + cint(TotalWarps)
 
+proc linearQ8_0Phase(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
+                     inDim: cint, outDim: cint) {.hippoDevice, used.} =
+  let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
+  let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
+  let globalWarpId = cint(blockIdx.x) * cint(WarpsPerBlock) + warpId
+  let wArr = cast[ptr UncheckedArray[uint8]](w)
+  let xArr = cast[ptr UncheckedArray[cfloat]](x)
+  let outArr = cast[ptr UncheckedArray[cfloat]](dst)
+  let nBlocksPerRow = inDim div 32'i32
+  let rowSizeBytes = nBlocksPerRow * cint(BlockQ8_0Size)
+  var row = globalWarpId
+  while row < outDim:
+    let rowBase = row * rowSizeBytes
+    var acc: cfloat = 0.0
+    var blkIdx: cint = 0
+    while blkIdx < nBlocksPerRow:
+      let bs = rowBase + blkIdx * cint(BlockQ8_0Size)
+      let eb = blkIdx * 32'i32
+      let dRaw = uint16(wArr[bs]) or (uint16(wArr[bs + 1'i32]) shl 8)
+      let d = hippoHalfToFloat(dRaw)
+      let qVal = cast[int8](wArr[bs + 2'i32 + laneId])
+      acc = acc + d * cfloat(qVal) * xArr[eb + laneId]
+      blkIdx = blkIdx + 1'i32
+    acc = acc + hippoShflDown(acc, 16)
+    acc = acc + hippoShflDown(acc, 8)
+    acc = acc + hippoShflDown(acc, 4)
+    acc = acc + hippoShflDown(acc, 2)
+    acc = acc + hippoShflDown(acc, 1)
+    if laneId == 0'i32:
+      outArr[row] = acc
+    row = row + cint(TotalWarps)
+
 proc linearPhase(dst: ptr cfloat, x: ptr cfloat, w: MkWeight,
                  inDim: cint, outDim: cint) {.hippoDevice, used.} =
   if w.qtype == 10'i32:
@@ -614,6 +678,8 @@ proc linearPhase(dst: ptr cfloat, x: ptr cfloat, w: MkWeight,
     linearQ3KPhase(dst, x, cast[ptr uint8](w.p), inDim, outDim)
   elif w.qtype == 0'i32:
     linearF32Phase(dst, x, cast[ptr cfloat](w.p), inDim, outDim)
+  elif w.qtype == 8'i32:
+    linearQ8_0Phase(dst, x, cast[ptr uint8](w.p), inDim, outDim)
 
 proc ropePhase(q: ptr cfloat, k: ptr cfloat, theta: ptr cfloat,
                nHeadQ: cint, nHeadK: cint, headDim: cint,
@@ -733,83 +799,83 @@ proc siluMulPhase(gate: ptr cfloat, up: ptr cfloat, dim: cint) {.hippoDevice, us
     i = i + stride
 
 # ---------------------------------------------------------------------------
-# Persistent cooperative kernel
+# Persistent cooperative kernel (disabled — grid.sync() wrong primitive on gfx1151)
 # ---------------------------------------------------------------------------
 
-proc megakernelDecode(
-  weights: ptr MkModelWeights, bufs: ptr MkBuffers,
-  tokenId: cint, curLen: cint, cacheCols: cint
-) {.hippoGlobal.} =
-  let act0 = cast[ptr cfloat](bufs.act0)
-  let act1 = cast[ptr cfloat](bufs.act1)
-  let s0 = cast[ptr cfloat](bufs.scratch0)
-  let s1 = cast[ptr cfloat](bufs.scratch1)
-  let s2 = cast[ptr cfloat](bufs.scratch2)
-  let logitsP = cast[ptr cfloat](bufs.logits)
-  let nEmb = cint(ModelCfg.nEmb)
-  let eps = cfloat(ModelCfg.rmsEps)
+when not defined(useIndividualLaunches):
+  proc megakernelDecode(
+    weights: ptr MkModelWeights, bufs: ptr MkBuffers,
+    tokenId: cint, curLen: cint, cacheCols: cint
+  ) {.hippoGlobal.} =
+    let act0 = cast[ptr cfloat](bufs.act0)
+    let act1 = cast[ptr cfloat](bufs.act1)
+    let s0 = cast[ptr cfloat](bufs.scratch0)
+    let s1 = cast[ptr cfloat](bufs.scratch1)
+    let s2 = cast[ptr cfloat](bufs.scratch2)
+    let logitsP = cast[ptr cfloat](bufs.logits)
+    let nEmb = cint(ModelCfg.nEmb)
+    let eps = cfloat(ModelCfg.rmsEps)
 
-  embeddingPhase(act0, cast[ptr cfloat](weights.tokEmb), tokenId, nEmb)
-  gridSync()
-
-  rmsnormPhase(act1, act0, cast[ptr cfloat](weights.layers[0].attnNorm), nEmb, eps)
-  gridSync()
-
-  var layer: cint = 0
-  while layer < cint(ModelCfg.nLayers):
-    # Access layer weights via pointer — no struct copy (avoids nimZeroMem)
-    let kvK = cast[ptr cfloat](bufs.kvK[layer])
-    let kvV = cast[ptr cfloat](bufs.kvV[layer])
-
-    linearPhase(s0, act1, weights.layers[layer].wq, nEmb, cint(QDim))
-    linearPhase(s1, act1, weights.layers[layer].wk, nEmb, cint(KvDim))
-    linearPhase(s2, act1, weights.layers[layer].wv, nEmb, cint(KvDim))
+    embeddingPhase(act0, cast[ptr cfloat](weights.tokEmb), tokenId, nEmb)
     gridSync()
 
-    ropePhase(s0, s1, cast[ptr cfloat](weights.ropeTheta),
-              cint(ModelCfg.nHead), cint(ModelCfg.nHeadKv), cint(ModelCfg.headDim),
-              cint(ModelCfg.ropeDim), curLen)
-    gridSync()
-    storeKVPhase(kvK, s1, kvV, s2, cint(KvDim), cacheCols, curLen)
+    rmsnormPhase(act1, act0, cast[ptr cfloat](weights.layers[0].attnNorm), nEmb, eps)
     gridSync()
 
-    attentionPhase(s1, s0, kvK, kvV,
-                   cint(ModelCfg.nHead), cint(ModelCfg.nHeadKv), cint(ModelCfg.headDim),
-                   curLen + 1, cacheCols)
-    gridSync()
+    var layer: cint = 0
+    while layer < cint(ModelCfg.nLayers):
+      let kvK = cast[ptr cfloat](bufs.kvK[layer])
+      let kvV = cast[ptr cfloat](bufs.kvV[layer])
 
-    linearPhase(s0, s1, weights.layers[layer].wo, cint(QDim), nEmb)
-    gridSync()
-
-    addPhase(act0, s0, nEmb)
-    gridSync()
-
-    rmsnormPhase(act1, act0, cast[ptr cfloat](weights.layers[layer].ffnNorm), nEmb, eps)
-    gridSync()
-
-    linearPhase(s0, act1, weights.layers[layer].wGate, nEmb, cint(ModelCfg.ffnDim))
-    linearPhase(s1, act1, weights.layers[layer].wUp, nEmb, cint(ModelCfg.ffnDim))
-    gridSync()
-
-    siluMulPhase(s0, s1, cint(ModelCfg.ffnDim))
-    gridSync()
-
-    linearPhase(s1, s0, weights.layers[layer].wDown, cint(ModelCfg.ffnDim), nEmb)
-    gridSync()
-
-    addPhase(act0, s1, nEmb)
-    gridSync()
-
-    if layer < cint(ModelCfg.nLayers) - 1:
-      rmsnormPhase(act1, act0,
-                   cast[ptr cfloat](weights.layers[layer + 1].attnNorm), nEmb, eps)
+      linearPhase(s0, act1, weights.layers[layer].wq, nEmb, cint(QDim))
+      linearPhase(s1, act1, weights.layers[layer].wk, nEmb, cint(KvDim))
+      linearPhase(s2, act1, weights.layers[layer].wv, nEmb, cint(KvDim))
       gridSync()
 
-    layer = layer + 1
+      ropePhase(s0, s1, cast[ptr cfloat](weights.ropeTheta),
+                cint(ModelCfg.nHead), cint(ModelCfg.nHeadKv), cint(ModelCfg.headDim),
+                cint(ModelCfg.ropeDim), curLen)
+      gridSync()
+      storeKVPhase(kvK, s1, kvV, s2, cint(KvDim), cacheCols, curLen)
+      gridSync()
 
-  rmsnormPhase(act1, act0, cast[ptr cfloat](weights.outputNorm), nEmb, eps)
-  gridSync()
-  linearPhase(logitsP, act1, weights.outputWeight, nEmb, cint(ModelCfg.nVocab))
+      attentionPhase(s1, s0, kvK, kvV,
+                     cint(ModelCfg.nHead), cint(ModelCfg.nHeadKv), cint(ModelCfg.headDim),
+                     curLen + 1, cacheCols)
+      gridSync()
+
+      linearPhase(s0, s1, weights.layers[layer].wo, cint(QDim), nEmb)
+      gridSync()
+
+      addPhase(act0, s0, nEmb)
+      gridSync()
+
+      rmsnormPhase(act1, act0, cast[ptr cfloat](weights.layers[layer].ffnNorm), nEmb, eps)
+      gridSync()
+
+      linearPhase(s0, act1, weights.layers[layer].wGate, nEmb, cint(ModelCfg.ffnDim))
+      linearPhase(s1, act1, weights.layers[layer].wUp, nEmb, cint(ModelCfg.ffnDim))
+      gridSync()
+
+      siluMulPhase(s0, s1, cint(ModelCfg.ffnDim))
+      gridSync()
+
+      linearPhase(s1, s0, weights.layers[layer].wDown, cint(ModelCfg.ffnDim), nEmb)
+      gridSync()
+
+      addPhase(act0, s1, nEmb)
+      gridSync()
+
+      if layer < cint(ModelCfg.nLayers) - 1:
+        rmsnormPhase(act1, act0,
+                     cast[ptr cfloat](weights.layers[layer + 1].attnNorm), nEmb, eps)
+        gridSync()
+
+      layer = layer + 1
+
+    rmsnormPhase(act1, act0, cast[ptr cfloat](weights.outputNorm), nEmb, eps)
+    gridSync()
+    linearPhase(logitsP, act1, weights.outputWeight, nEmb, cint(ModelCfg.nVocab))
 
 # ---------------------------------------------------------------------------
 # Host-side dispatch helpers
@@ -946,11 +1012,23 @@ proc gpuLinearQ3K(dst, x, w: pointer, inDim, outDim: int) =
     stream = mkStream,
     args = hippoArgs(dstP, xP, wP, iDim, oDim))
 
+proc gpuLinearQ8_0(dst, x, w: pointer, inDim, outDim: int) =
+  var dstP = cast[ptr cfloat](dst)
+  var xP = cast[ptr cfloat](x)
+  var wP = cast[ptr uint8](w)
+  var iDim = cint(inDim)
+  var oDim = cint(outDim)
+  hippoLaunchKernel(linearQ8_0WarpKernel,
+    gridDim = newDim3(outDim.uint32), blockDim = newDim3(mkc.WarpSize.uint32),
+    stream = mkStream,
+    args = hippoArgs(dstP, xP, wP, iDim, oDim))
+
 proc gpuLinear(dst, x: pointer, w: MkWeight, inDim, outDim: int) =
   case w.qtype
   of GgmlTypeF32.int32: gpuLinearF32(dst, x, w.p, inDim, outDim)
   of GgmlTypeQ2K.int32: gpuLinearQ2K(dst, x, w.p, inDim, outDim)
   of GgmlTypeQ3K.int32: gpuLinearQ3K(dst, x, w.p, inDim, outDim)
+  of GgmlTypeQ8_0.int32: gpuLinearQ8_0(dst, x, w.p, inDim, outDim)
   else: raise newException(ValueError, "unsupported qtype for gpuLinear: " & $w.qtype)
 
 # ---------------------------------------------------------------------------
@@ -989,6 +1067,20 @@ proc uploadAsF32(m: var Model, tensorName: string): MkWeight =
   hippoMemcpyAsync(alloc.p, addr t.data[0], bytes, HippoMemcpyHostToDevice, mkStream)
   mkWeightAllocs.add(alloc)
   MkWeight(p: alloc.p, qtype: GgmlTypeF32.int32)
+
+proc uploadAsQ8_0(m: var Model, tensorName: string, nCols, nRows: int): MkWeight =
+  let t = m.getTensor(tensorName)
+  let rowSize = rowSizeQ8_0(nCols)
+  let totalBytes = rowSize * nRows
+  var q8Buf = newSeq[byte](totalBytes)
+  for r in 0 ..< nRows:
+    let srcRow = cast[ptr UncheckedArray[float32]](addr t.data[r * nCols])
+    let dstRow = cast[ptr UncheckedArray[byte]](addr q8Buf[r * rowSize])
+    quantizeRowQ8_0(srcRow, dstRow, nCols)
+  let alloc = hippoMalloc(totalBytes)
+  hippoMemcpyAsync(alloc.p, addr q8Buf[0], totalBytes, HippoMemcpyHostToDevice, mkStream)
+  mkWeightAllocs.add(alloc)
+  MkWeight(p: alloc.p, qtype: GgmlTypeQ8_0.int32)
 
 proc uploadF32(m: var Model, tensorName: string): pointer =
   let t = m.getTensor(tensorName)
@@ -1064,11 +1156,11 @@ proc loadModelBackend*(m: var Model, hp: HParams) =
     mkWeights.layers[layer].wUp = uploadQuantRaw(m, lp & "ffn_up.weight")
     mkWeights.layers[layer].wDown = uploadQuantRaw(m, lp & "ffn_down.weight")
 
-  # Output — always dequant to F32 for simplicity (avoid needing Q6K/Q3K GEMV kernels)
+  # Output — requantize to Q8_0 for ~4x bandwidth reduction vs F32
   mkWeights.outputNorm = loadF32Ptr(m, "output_norm.weight")
   let outName = if m.infos.hasKey("output.weight"): "output.weight"
                 else: "token_embd.weight"
-  mkWeights.outputWeight = uploadAsF32(m, outName)
+  mkWeights.outputWeight = uploadAsQ8_0(m, outName, ModelCfg.nEmb, ModelCfg.nVocab)
 
   # RoPE theta
   let halfRope = ModelCfg.ropeDim div 2

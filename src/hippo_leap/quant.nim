@@ -95,6 +95,40 @@ proc halfToFloat*(h: uint16): float32 =
     let sign = (if s == 1: -1.0'f32 else: 1.0'f32)
     return sign * mant * pow(2.0'f32, float32(exp))
 
+proc floatToHalf*(f: float32): uint16 =
+  let bits = cast[uint32](f)
+  let s = uint16((bits shr 16) and 0x8000'u32)
+  let e = int((bits shr 23) and 0xFF'u32) - 127
+  let m = bits and 0x7FFFFF'u32
+  if e <= -15:
+    return s
+  if e > 15:
+    return s or 0x7C00'u16
+  return s or uint16((e + 15) shl 10) or uint16(m shr 13)
+
+proc quantizeRowQ8_0*(src: ptr UncheckedArray[float32],
+                      dst: ptr UncheckedArray[byte], k: int) =
+  if (k mod QK8_0) != 0:
+    raise newException(ValueError, "q8_0 quantize: row size must be multiple of 32")
+  let nBlocks = k div QK8_0
+  var inIdx = 0
+  var offset = 0
+  for _ in 0 ..< nBlocks:
+    var amax: float32 = 0.0
+    for j in 0 ..< QK8_0:
+      let av = abs(src[inIdx + j])
+      if av > amax: amax = av
+    let d = amax / 127.0'f32
+    let dHalf = floatToHalf(d)
+    dst[offset] = byte(dHalf and 0xFF'u16)
+    dst[offset + 1] = byte(dHalf shr 8)
+    let id = if d != 0.0'f32: 1.0'f32 / d else: 0.0'f32
+    for j in 0 ..< QK8_0:
+      let v = src[inIdx + j] * id
+      dst[offset + 2 + j] = cast[byte](int8(clamp(round(v), -128.0'f32, 127.0'f32)))
+    inIdx = inIdx + QK8_0
+    offset = offset + BlockQ8_0Size
+
 proc dequantRowQ2K*(src: ptr UncheckedArray[byte], dst: ptr UncheckedArray[float32], k: int) =
   ## Dequantize a row of k elements in Q2_K format.
   if (k mod QK_K) != 0:
