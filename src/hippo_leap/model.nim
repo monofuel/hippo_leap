@@ -1,7 +1,7 @@
 ## Minimal model loader that reads GGUF tensors into float32.
 
 import
-  std/[tables],
+  std/[sequtils, tables],
   ./[gguf_loader, tensor, quant]
 
 when cpuEndian != littleEndian:
@@ -10,6 +10,7 @@ when cpuEndian != littleEndian:
 const
   GgmlTypeF32* = 0
   GgmlTypeF16* = 1
+  GgmlTypeQ5_0* = 6
   GgmlTypeQ8_0* = 8
   GgmlTypeQ2K* = 10
   GgmlTypeQ3K* = 11
@@ -30,6 +31,13 @@ type
     ropeDim*: int
     ropeFreqBase*: float32
     rmsEps*: float32
+    ssmConvKernel*: int
+    ssmStateSize*: int
+    ssmGroupCount*: int
+    ssmInnerSize*: int
+    ssmDtRank*: int
+    layerNFfn*: seq[int]
+    layerNHeadKv*: seq[int]
 
   Model* = object
     hparams*: HParams
@@ -72,6 +80,12 @@ proc loadTensorF32(g: GgufFile, info: GgufTensorInfo): Tensor =
       let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
       let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
       dequantRowQ8_0(src, dst, rowLen)
+  of GgmlTypeQ5_0:
+    let rowSize = rowSizeQ5_0(rowLen)
+    for r in 0 ..< rows:
+      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
+      let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
+      dequantRowQ5_0(src, dst, rowLen)
   of GgmlTypeQ2K:
     let rowSize = rowSizeQ2K(rowLen)
     for r in 0 ..< rows:
@@ -115,8 +129,20 @@ proc loadHParams(g: GgufFile): HParams =
   var f: float32
   if g.getKvF32(prefix & "rope.freq_base", f): result.ropeFreqBase = f
   if g.getKvF32(prefix & "attention.layer_norm_rms_epsilon", f): result.rmsEps = f
+  if g.getKvU32(prefix & "ssm.conv_kernel", v): result.ssmConvKernel = int(v)
+  if g.getKvU32(prefix & "ssm.state_size", v): result.ssmStateSize = int(v)
+  if g.getKvU32(prefix & "ssm.group_count", v): result.ssmGroupCount = int(v)
+  if g.getKvU32(prefix & "ssm.inner_size", v): result.ssmInnerSize = int(v)
+  if g.getKvU32(prefix & "ssm.time_step_rank", v): result.ssmDtRank = int(v)
+  var arrI32: seq[int32]
+  if g.getKvArrI32(prefix & "feed_forward_length", arrI32):
+    result.layerNFfn = arrI32.mapIt(int(it))
+  if g.getKvArrI32(prefix & "attention.head_count_kv", arrI32):
+    result.layerNHeadKv = arrI32.mapIt(int(it))
   if result.headDim == 0 and result.nHead > 0 and result.nEmb > 0:
     result.headDim = result.nEmb div result.nHead
+  if result.ropeFreqBase == 0.0'f32:
+    result.ropeFreqBase = 10000.0'f32
   if result.ropeDim == 0:
     result.ropeDim = result.headDim
   if result.nVocab == 0:

@@ -10,6 +10,12 @@ import
 type
   HippoAllocRef* = type(hippoMalloc(1))
 
+  LayerKind* = enum
+    lkAttentionFfn
+    lkAttention
+    lkFfnOnly
+    lkSsm
+
   GpuTensor* = object
     devicePtr*: pointer
     alloc*: HippoAllocRef
@@ -24,6 +30,11 @@ type
     nHeadKv*: int
     headDim*: int
 
+  SsmGpuState* = object
+    convState*: seq[GpuTensor]
+    recState*: seq[GpuTensor]
+    ssmLayerMap*: seq[int]
+
   KvCache* = object
     k*: seq[Tensor]
     v*: seq[Tensor]
@@ -32,6 +43,7 @@ type
     nHeadKv*: int
     headDim*: int
     gpuCache*: GpuKvCache
+    ssmState*: SsmGpuState
 
   GpuQuantWeight* = object
     devicePtr*: pointer
@@ -41,6 +53,7 @@ type
     nCols*: int
 
   LayerGpuPtrs* = object
+    kind*: LayerKind
     attnNorm*, ffnNorm*: pointer
     wq*, wk*, wv*, wo*: pointer
     wGate*, wUp*, wDown*: pointer
@@ -50,6 +63,14 @@ type
     wColsQ*, wColsDown*: int
     wqQType*, wkQType*, wvQType*, woQType*: int32
     wGateQType*, wUpQType*, wDownQType*: int32
+    # SSM (Mamba2) fields
+    ssmInQ*, ssmOutQ*: pointer
+    ssmInQType*, ssmOutQType*: int32
+    ssmConv1dW*, ssmConv1dBias*: pointer
+    ssmDtBias*, ssmA*, ssmD*: pointer
+    ssmNorm*: pointer
+    layerNFfn*: int
+    layerNHeadKv*: int
 
   ModelGpuPtrs* = object
     layers*: seq[LayerGpuPtrs]

@@ -7,9 +7,11 @@ when cpuEndian != littleEndian:
 const
   QK_K* = 256
   QK8_0* = 32
+  QK5_0* = 32
   BlockQ2KSize* = 2 + 2 + (QK_K div 16) + (QK_K div 4)
   BlockQ3KSize* = 2 + (QK_K div 4) + (QK_K div 8) + 12
   BlockQ4KSize* = 2 + 2 + 12 + (QK_K div 2)   # d + dmin + scales + 4-bit quants
+  BlockQ5_0Size* = 2 + 4 + (QK5_0 div 2)       # fp16 scale + 32 high bits + 4-bit quants
   BlockQ6KSize* = 2 + (QK_K div 16) + 3 * (QK_K div 4)
   BlockQ8_0Size* = 2 + QK8_0                    # fp16 scale + int8 quants
 
@@ -35,6 +37,11 @@ proc rowSizeQ6K*(rowLen: int): int =
   if (rowLen mod QK_K) != 0:
     raise newException(ValueError, "q6_K row size must be multiple of 256")
   (rowLen div QK_K) * BlockQ6KSize
+
+proc rowSizeQ5_0*(rowLen: int): int =
+  if (rowLen mod QK5_0) != 0:
+    raise newException(ValueError, "q5_0 row size must be multiple of 32")
+  (rowLen div QK5_0) * BlockQ5_0Size
 
 proc rowSizeQ8_0*(rowLen: int): int =
   if (rowLen mod QK8_0) != 0:
@@ -210,6 +217,31 @@ proc dequantRowQ4K*(src: ptr UncheckedArray[byte], dst: ptr UncheckedArray[float
       qOff += 32
       isIdx += 2
     offset += BlockQ4KSize
+
+proc dequantRowQ5_0*(src: ptr UncheckedArray[byte], dst: ptr UncheckedArray[float32], k: int) =
+  if (k mod QK5_0) != 0:
+    raise newException(ValueError, "q5_0 row size must be multiple of 32")
+  let nBlocks = k div QK5_0
+  var outIdx = 0
+  var offset = 0
+  for _ in 0 ..< nBlocks:
+    var dRaw = cast[ptr UncheckedArray[uint16]](addr src[offset])[0]
+    when cpuEndian != littleEndian:
+      dRaw = swapEndian(dRaw)
+    let d = halfToFloat(dRaw)
+    let qh = cast[ptr UncheckedArray[uint8]](addr src[offset + 2])
+    let qhBits = uint32(qh[0]) or (uint32(qh[1]) shl 8) or
+                 (uint32(qh[2]) shl 16) or (uint32(qh[3]) shl 24)
+    let qs = cast[ptr UncheckedArray[uint8]](addr src[offset + 6])
+    for j in 0 ..< QK5_0 div 2:
+      let xlo0 = qs[j] and 0x0F
+      let xlo1 = qs[j] shr 4
+      let xhi0 = uint8((qhBits shr uint32(j)) and 1) shl 4
+      let xhi1 = uint8((qhBits shr uint32(j + 16)) and 1) shl 4
+      dst[outIdx + j] = d * float32(int(xhi0 or xlo0) - 16)
+      dst[outIdx + j + QK5_0 div 2] = d * float32(int(xhi1 or xlo1) - 16)
+    outIdx += QK5_0
+    offset += BlockQ5_0Size
 
 proc dequantRowQ8_0*(src: ptr UncheckedArray[byte], dst: ptr UncheckedArray[float32], k: int) =
   if (k mod QK8_0) != 0:
