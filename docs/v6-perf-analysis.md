@@ -167,11 +167,9 @@ Aggressive fusion could cut launches from ~330 to <100 per token.
 | 4 | Check gfx1151 clock bug (rocm-smi) | Idle at 600 MHz | Test too short to catch sustained clocks; needs longer benchmark |
 | 5 | Hybrid persistent for tight phases | Not attempted | Requires interpreter-style design |
 | 6 | Interpreter-style persistent kernel | Not attempted | Very high effort |
-| 7 | HIP Graph capture | **No improvement** | Graph replay matches individual launches at ~133 tok/s (clocks pinned) |
-| 8 | gfx1100 codegen workaround | **No improvement** | ~133 tok/s with clocks pinned, same as native gfx1151 |
-| 9 | Pin GPU clocks to high | **~133 tok/s (+30%)** | `echo high > power_dpm_force_performance_level` → 2863 MHz |
 
-**Current best: ~133 tok/s** (Q8_0 output, GPU clocks pinned to 2863 MHz).
+
+**Current best: ~102 tok/s** (Q8_0 output, no LDS, no fusion).
 
 Key finding: On Strix Halo iGPU with unified LPDDR5X and 32MB L2,
 both LDS caching and sequential kernel fusion are counterproductive.
@@ -179,33 +177,9 @@ The L2 is already efficient for the 8KB activation vector, and
 individual kernel launches enable better parallelism across CUs than
 fused sequential approaches.
 
-## v8 Results: Clock Management is the Bottleneck
-
-With `power_dpm_force_performance_level=auto` (default), the GPU
-idles at 600 MHz and ramps slowly during inference. Short benchmarks
-measure artifically low throughput because the GPU spends the first
-~5 tokens ramping up from 600 → 2863 MHz.
-
-With `power_dpm_force_performance_level=high`, the GPU stays at
-2863 MHz and all optimization variants converge:
-
-| Variant | Auto clocks | Pinned 2863 MHz |
-|---------|-------------|-----------------|
-| Individual launches (gfx1151) | ~102 tok/s | **~133 tok/s** |
-| HIP Graph capture (gfx1151) | ~106 tok/s | ~132 tok/s |
-| Individual (gfx1100 override) | ~124 tok/s | ~133 tok/s |
-| Graph + gfx1100 | ~107 tok/s | ~132 tok/s |
-
-HIP Graph capture has negligible effect — individual launches
-are not the bottleneck. The ~269 kernel launches at ~9.5ms/token
-run efficiently because the GPU is always waiting on weight reads
-from LPDDR5X, not waiting for CPU dispatch. Graph capture just
-eliminates overhead that was already hidden by memory latency.
-
-gfx1100 codegen shows ~17% improvement with auto clocks but zero
-improvement with pinned clocks — the codegen difference was a
-measurement artifact from faster clock ramp (gfx1100 binary
-apparently triggers faster DVFS response).
+See [v8-graph-and-clocks.md](v8-graph-and-clocks.md) for further
+investigation into HIP Graph capture, gfx1100 codegen, and GPU clock
+management (~133 tok/s with clocks pinned).
 
 ## What to Drop
 
@@ -213,8 +187,5 @@ apparently triggers faster DVFS response).
   primitive on this hardware, measured 5x regression
 - Further optimization of grid sync barriers — fundamental
   limitation of the implementation on RDNA 3.5 iGPU
-- HIP Graph capture — no benefit, launch overhead is hidden
-  behind memory latency
-- gfx1100 codegen workaround — no benefit with clocks pinned
 - Chasing exact parity with llama.cpp Vulkan numbers — part of
   the gap is gfx1151 codegen quality, not kernel design
