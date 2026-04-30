@@ -123,81 +123,87 @@ The pure weight bandwidth limit for TinyLlama Q2_K is ~400MB of weights at
 irreducible compute) but it shows the gap between current performance and
 the hardware ceiling.
 
-## Compile-time kernel fusion via Nim macros
+## Compile-time specialization via Nim templates
 
-Use Nim's compile-time metaprogramming to automatically generate fused
-mega-kernels from a high-level pipeline description.
+HPC-style approach: we know our hardware, we know the model, compile a binary
+that's perfect for that exact combination. One binary per (model, machine,
+quant) triple — e.g. `hippo_leap_qwen36_35b_q4k_azem`.
 
-### The concept
+See `docs/wmma-experiment-and-specialized-backend.md` Part 4 for the full
+design of MachineConfig and model config types.
 
-Define the decode pipeline as a compile-time dataflow graph:
+### What static configs enable for kernels
+
+With model dimensions and machine specs as compile-time constants:
+
+- **Loop bounds are literals.** `nEmb`, `headDim`, `nExperts` become exact
+  constants. The compiler unrolls, vectorizes, and constant-folds LDS sizing.
+- **No layer-kind dispatch.** The layer sequence is known at compile time.
+  For Qwen3.6: 30x `gdnMoeLayer` + 10x `attnMoeLayer` interleaved at
+  `fullAttnInterval=4`, all inlined as a straight-line sequence.
+- **Dead code elimination.** Only the quant kernels for the target format
+  are compiled. No runtime dispatch on quant type.
+- **Machine-aware tuning.** Block sizes and warp counts derived from
+  `Machine.gpu.cuCount` and `Machine.gpu.ldsBytes` at compile time.
+
+### Template-per-layer-kind fusion
+
+Rather than a grand macro DSL that unifies everything, write fused templates
+per layer kind. Each layer kind has a fixed dataflow — the template composes
+the operations with static dimensions:
 
 ```nim
-decodeKernel(TinyLlama):
-  let xNorm = rmsnorm(x, attnNorm)
-  let q = gemvQ2K(xNorm, wq)
-  let kv = fusedGemvQ2KQ3K(xNorm, wk, wv)
-  let qk = rope(q, kv.k, thetaTable, pos)
-  storeKV(kv, cache, pos)
-  let attn = attention(qk, cache, pos)
-  let xOut = gemvQ2K(attn, wo)
-  residualAdd(x, xOut)
-  # ... FFN block
+template attnFfnDecode(cfg: static TransformerConfig,
+                       machine: static MachineConfig) =
+  # All dimensions are compile-time constants
+  const blockSize = when machine.gpu.cuCount <= 16: 128 else: 256
+  rmsnormFused(x, attnNorm, cfg.nEmb)  # stays in LDS
+  gemvQ4K(q, x, wq, cfg.nEmb, cfg.nHead * cfg.headDim)
+  # ...entire layer as one fused sequence
 ```
 
-A Nim macro would see the entire dataflow and at compile time:
+This works well for attention and FFN layers. For layer kinds with dynamic
+control flow (MoE routing, Delta Net recurrence), keep those as separate
+kernel phases — they don't fuse well into persistent kernels because:
 
-- **Auto-fuse adjacent ops** — if rmsnorm output feeds directly into a GEMV,
-  emit one kernel that keeps the intermediate in LDS instead of global memory
-- **Assign warps to roles** — macro knows CU count, LDS budget, register
-  pressure. Partitions warps across ops, inserts grid barriers between phases
-- **Eliminate temporaries** — sees that `xNorm` is consumed once, keeps it in
-  registers/LDS instead of writing to global memory
-- **Specialize per model** — model params become compile-time constants. nEmb,
-  headDim, nLayer become exact loop bounds, unrolled to known dimensions.
-  No runtime conditionals
-- **Specialize per GPU** — WarpSize, CU count, LDS size are compile-time
-  constants. Generates a kernel tuned exactly for the target architecture
+- **MoE routing** is data-dependent (don't know which expert weights to
+  load until after the router runs)
+- **Delta Net state** updates are sequential per-head with error correction
+
+### Persistent mega-kernel per layer kind
+
+For the non-dynamic portions, a persistent kernel that stays resident on
+all CUs and uses grid-level barriers between phases:
+
+- Grid barriers (`hippoGridSync`) cost ~100 cycles vs ~2000-5000 for a
+  kernel launch round-trip
+- Input vector stays in LDS across phases (no global memory round-trips)
+- Software pipelining: prefetch next layer's weights during current layer
+
+### What hippo needs
+
+1. `hippoGridSync` primitive (wraps `cooperative_groups::grid_group::sync()`)
+2. `hippoCooperativeLaunch` (wraps `hipLaunchCooperativeKernel`)
+
+### Why Nim templates beat other approaches
+
+- **TVM/Triton** — Python DSLs that optimize individual kernels, not
+  cross-kernel fusion with static model dimensions
+- **torch.compile** — too high-level to reason about quant block layouts
+  or warp assignment
+- **CUTLASS** — C++ templates for single GEMM tiles, not full layers
+- **Nim templates** — operate on real code with compile-time constants.
+  The compiler does the fusion naturally through inlining and dead code
+  elimination. No separate DSL or code generator needed.
 
 ### Type-safe kernel composition
 
-Nim's type system could enforce correctness at compile time:
+Nim's type system enforces correctness at compile time:
 
 ```nim
 type GpuTensor[Q: static QuantType, Rows, Cols: static int] = object
 ```
 
-A `GpuTensor[Q2K, 2048, 256]` carries its quant format and dimensions.
-`fusedGemv` refuses to compile if quant types don't match what the fused
-kernel supports. Compile-time errors instead of silent numerical garbage.
-
-### Why this is better than existing approaches
-
-- **TVM/Triton** — generate kernels from Python DSLs but can't easily do
-  cross-kernel fusion. Optimize individual kernels, not whole pipelines.
-- **torch.compile** — traces Python but the abstraction is too high. Can't
-  reason about quant block layouts or warp assignment.
-- **CUTLASS** — C++ templates that specialize GEMM tiles. Powerful but limited
-  to single operations, not full transformer layers.
-- **Nim macros** — operate on the AST with full Turing-complete logic. Could
-  write a scheduler that assigns CU workgroups at compile time based on model
-  architecture.
-
-### What hippo needs for this
-
-1. `hippoGridSync` primitive (wraps `cooperative_groups::grid_group::sync()`)
-2. `hippoCooperativeLaunch` (wraps `hipLaunchCooperativeKernel`)
-3. A Nim macro library that takes the pipeline DSL and emits fused kernel code
-4. A compile-time scheduler mapping operations to warp groups given HW constraints
-
-### Incremental path
-
-1. Start by auto-fusing two ops (e.g., rmsnorm + GEMV), validate against the
-   hand-written kernels
-2. Add grid sync + cooperative launch to hippo
-3. Expand the macro to handle a full layer
-4. Eventually generate the entire decode mega-kernel from the DSL
-
-The end result: an ML compiler that fits in a Nim macro library instead of
-being a massive infrastructure project like XLA or TVM. Compile-time kernel
-fusion, model-specialized, GPU-specialized, with type safety.
+A `GpuTensor[Q4K, 2048, 256]` carries its quant format and dimensions.
+`fusedGemv` refuses to compile if quant types don't match. Compile-time
+errors instead of silent numerical garbage.

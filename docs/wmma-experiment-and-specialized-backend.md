@@ -240,50 +240,147 @@ simplifies, and the advantage of general-purpose matrix accelerators (WMMA,
 cooperative matrix) shrinks. At 1.58 bits there's nothing to accelerate —
 the operation is already trivial. This plays to our strengths.
 
-### Compile-Time Specialization (Incremental, Not Grand)
+### Compile-Time Specialization (HPC Style)
 
-Rather than building a full macro DSL megakernel system, pursue specialization
-incrementally:
+Take the HPC approach: we know our hardware, we know the model we want to run,
+compile a binary that's perfect for that exact combination. One binary per
+(model, machine, quant) triple — e.g. `hippo_leap_qwen36_35b_q4k_azem`. No
+runtime flexibility, maximum performance.
 
-**Step 1: Compile-time model constants.** Make dimensions, head counts, layer
-counts available as `const` values. Loop bounds become literals, the compiler
-unrolls and optimizes naturally. No new abstractions needed — just `when` and
-`static`.
+#### Machine Configs
 
-```nim
-const HiddenDim {.intdefine.} = 2048
-const FFNDim {.intdefine.} = 8192
-const NHeads {.intdefine.} = 32
-```
-
-**Step 2: Quant-type specialization.** Instead of runtime dispatch on quant
-type, compile separate binaries (or use `when` blocks) for Q4K, Q6K, Q2K,
-ternary. Dead code elimination removes unused quant paths entirely.
-
-**Step 3: Kernel fusion where it's obvious.** Fuse operations that always run
-back-to-back (RMSnorm+GEMV, GEMV+residual). Don't try to fuse everything —
-just the cases where the intermediate data is small and the launch overhead
-is large relative to the work.
-
-**Step 4: Machine-aware tuning.** Block sizes, warp counts, and shared memory
-usage tuned per GPU. Not a runtime autotuner — just a config file per target
-that feeds compile-time constants.
+Structured by hostname with full hardware specs:
 
 ```nim
-# machine_gfx1151.nim
-const CUCount* = 16
-const LDSSize* = 65536
-const MemBandwidthGBs* = 250
+type
+  GpuSpec* = object
+    arch*: string
+    cuCount*: int
+    warpSize*: int
+    ldsBytes*: int
+    vramMB*: int
+    vramBandwidthGBs*: int
+    clockMhz*: int
 
-# machine_gfx1100.nim
-const CUCount* = 96
-const LDSSize* = 65536
-const MemBandwidthGBs* = 960
+  MemorySpec* = object
+    kind*: string
+    bandwidthGBs*: int
+    capacityGB*: int
+    l2CacheMB*: int
+
+  MachineConfig* = object
+    hostname*: string
+    processor*: string
+    gpu*: GpuSpec
+    memory*: MemorySpec
+
+const Azem* = MachineConfig(
+  hostname: "azem",
+  processor: "Ryzen AI Max+ 395",
+  gpu: GpuSpec(arch: "gfx1151", cuCount: 16, warpSize: 32,
+               ldsBytes: 65536, vramMB: 98304,
+               vramBandwidthGBs: 256, clockMhz: 2900),
+  memory: MemorySpec(kind: "LPDDR5X", bandwidthGBs: 256,
+                     capacityGB: 128, l2CacheMB: 32),
+)
+
+const HighSteel* = MachineConfig(
+  hostname: "high-steel",
+  processor: "Ryzen 9 7950X",
+  gpu: GpuSpec(arch: "gfx1100", cuCount: 96, warpSize: 32,
+               ldsBytes: 65536, vramMB: 24576,
+               vramBandwidthGBs: 960, clockMhz: 2500),
+  memory: MemorySpec(kind: "DDR5", bandwidthGBs: 89,
+                     capacityGB: 64, l2CacheMB: 6),
+)
 ```
 
-Each step is independently useful and testable. No step requires the previous
-ones to be "complete." This is the opposite of a grand unified plan — it's a
-toolkit of simple techniques that compose.
+Machine config drives kernel tuning: block sizes, warp counts, shared memory
+budgets, unroll factors. These are all compile-time constants — the compiler
+can constant-fold LDS sizing and eliminate dead branches.
+
+#### Model Configs
+
+Separate types per architecture — not a loose bag of consts:
+
+```nim
+type
+  TransformerConfig* = object
+    nEmb*, nHead*, nHeadKv*, headDim*: int
+    ffnDim*, nLayers*, nVocab*: int
+    ropeDim*: int
+    ropeTheta*: float64
+
+  SsmConfig* = object
+    innerSize*, nKHeads*, nVHeads*: int
+    headKDim*, headVDim*: int
+    convKernel*, dtRank*: int
+
+  MoeConfig* = object
+    nExperts*, nExpertsUsed*: int
+    expertFfnDim*: int
+
+  HybridGdnMoeConfig* = object
+    nEmb*, nVocab*, nLayers*: int
+    attn*: TransformerConfig
+    gdn*: SsmConfig
+    moe*: MoeConfig
+    fullAttnInterval*: int
+
+const Qwen3_0_6B* = TransformerConfig(
+  nEmb: 1024, nHead: 16, nHeadKv: 2, headDim: 64,
+  ffnDim: 2816, nLayers: 28, nVocab: 151936,
+  ropeDim: 64, ropeTheta: 1000000.0,
+)
+
+const Qwen36_35B_A3B* = HybridGdnMoeConfig(
+  nEmb: 2048, nVocab: 248320, nLayers: 40,
+  attn: TransformerConfig(
+    nEmb: 2048, nHead: 16, nHeadKv: 2, headDim: 256,
+    ffnDim: 0, nLayers: 10, nVocab: 248320,
+    ropeDim: 64, ropeTheta: 1000000.0),
+  gdn: SsmConfig(
+    innerSize: 4096, nKHeads: 16, nVHeads: 32,
+    headKDim: 128, headVDim: 128,
+    convKernel: 4, dtRank: 32),
+  moe: MoeConfig(
+    nExperts: 256, nExpertsUsed: 8, expertFfnDim: 512),
+  fullAttnInterval: 4,
+)
+```
+
+Each model type carries only the fields that apply. The GGUF loader becomes a
+weight reader only — it reads tensor data but doesn't discover architecture.
+Dimensions are compile-time constants, so the loader asserts they match.
+
+#### Build and Selection
+
+```nim
+const TargetMachine {.strdefine.} = "azem"
+const Machine* = when TargetMachine == "azem": Azem
+                 elif TargetMachine == "high-steel": HighSteel
+                 else: {.error: "Unknown machine: " & TargetMachine.}
+```
+
+```
+nim cpp -d:targetModel=qwen36_35b_q4k -d:targetMachine=azem --cc:hipcc ...
+```
+
+#### What This Enables
+
+- **No `case layerKind` dispatch.** The layer sequence is known at compile
+  time. For Qwen3.6: 30x `gdnMoeLayer` + 10x `attnMoeLayer` interleaved at
+  `fullAttnInterval=4`, all inlined as a straight-line sequence.
+- **Loop bounds are literals.** `nEmb`, `headDim`, `nExperts` become exact
+  constants. The compiler unrolls, vectorizes, and constant-folds shared
+  memory sizing.
+- **Dead code elimination.** Only the quant kernels for the target format
+  are compiled. No runtime dispatch on quant type.
+- **Machine-aware kernel tuning.** Block sizes and warp counts derived from
+  `Machine.gpu.cuCount` and `Machine.gpu.ldsBytes` at compile time.
+- **Kernel fusion per layer kind.** With static dimensions, fusing adjacent
+  ops (RMSnorm+GEMV, GEMV+residual) becomes straightforward since buffer
+  sizes are known constants.
 
 ### CPU Backend
 
@@ -331,11 +428,13 @@ real work.
 
 - **Ternary model support**: Add a ternary quant type to the GGUF loader and
   write CPU + GPU kernels. See how simple the code can be.
-- **Compile-time constants**: Try defining model dims as `-d:HiddenDim=2048`
-  and measure if the compiler makes measurably better code. Low effort, might
-  surprise us.
-- **Kernel fusion experiments**: Pick one obvious fusion (RMSnorm+GEMV or
-  GEMV+residual) and see how much it helps. One experiment, not a framework.
+- **HPC-style specialized binary**: Pick one model+machine pair (e.g.
+  Qwen3.6 Q4K on azem), wire up the MachineConfig and model config as
+  compile-time constants, and measure the compiler output difference.
+  Start with one kernel (e.g. RMSnorm) to validate the approach.
+- **Kernel fusion experiments**: With static dimensions in place, fuse
+  RMSnorm+GEMV or GEMV+residual as a template-per-layer-kind. Measure
+  launch overhead reduction.
 - **CPU SIMD GEMV**: Write a Q2K or ternary GEMV using nimsimd, benchmark
   against the GPU path for small models.
 
