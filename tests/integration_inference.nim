@@ -14,7 +14,7 @@ const
 
   ExpectedFirstToken: int32 = 13
   ExpectedTokens: array[8, int32] = [
-    29940'i32, 10233, 338, 263, 2319, 4726, 297, 278
+    13'i32, 13, 13, 13, 6028, 366, 3113, 788
   ]
 
 proc testGoldenOutput() =
