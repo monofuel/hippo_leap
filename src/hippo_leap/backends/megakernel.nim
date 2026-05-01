@@ -19,6 +19,8 @@ from ../megakernel_config import
 when not defined(cpp):
   {.error: "megakernel backend requires Nim's C++ backend. Build with `nim cpp`.".}
 
+{.passC: "-ffast-math".}
+
 # ---------------------------------------------------------------------------
 # Weight structure — compile-time sized per model config
 # ---------------------------------------------------------------------------
