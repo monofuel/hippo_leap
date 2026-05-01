@@ -20,6 +20,7 @@ type
     completionTokens*: int
     totalTokens*: int
     elapsedMs*: float64
+    gpuMs*: float64
 
   InferenceContext* = object
     model*: Model
@@ -74,10 +75,13 @@ proc generate*(ctx: var InferenceContext, text: string, maxTokens: int): Generat
   var generated: seq[int32]
   generated.add(nextToken)
 
+  var totalGpuMs: float32 = 0.0
   for i in 1 ..< maxGen:
     if nextToken in ctx.vocab.stopTokenIds:
       break
-    nextToken = forwardDecodeToken(ctx.model, nextToken, ctx.cache)
+    var stepMs: float32
+    nextToken = forwardDecodeTokenTimed(ctx.model, nextToken, ctx.cache, stepMs)
+    totalGpuMs += stepMs
     generated.add(nextToken)
 
   let t1 = epochTime()
@@ -89,4 +93,5 @@ proc generate*(ctx: var InferenceContext, text: string, maxTokens: int): Generat
     completionTokens: generated.len,
     totalTokens: promptTokens.len + generated.len,
     elapsedMs: (t1 - t0) * 1000.0,
+    gpuMs: float64(totalGpuMs),
   )

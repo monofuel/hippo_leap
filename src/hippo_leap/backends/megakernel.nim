@@ -88,6 +88,9 @@ var
   mkStepConfigAlloc: HippoAllocRef
   mkGraphExec: hipGraphExec_t
   mkGraphCaptured: bool = false
+  mkBenchEvent0: HippoEvent
+  mkBenchEvent1: HippoEvent
+  mkBenchEventsCreated: bool = false
 
 # ---------------------------------------------------------------------------
 # Q2K constants
@@ -2842,6 +2845,23 @@ proc forwardDecodeToken*(m: var Model, token: int32, cache: var KvCache): int32 
   forwardDecodeGpu(token, cache.curLen)
   gpuArgmax(mkBuf.argmaxResult, mkBuf.logits, ModelCfg.nVocab)
   hippoStreamSynchronize(mkStream)
+  var tokenId: cint
+  hippoMemcpy(addr tokenId, mkBuf.argmaxResult, sizeof(cint), HippoMemcpyDeviceToHost)
+  inc cache.curLen
+  result = int32(tokenId)
+
+proc forwardDecodeTokenTimed*(m: var Model, token: int32, cache: var KvCache,
+                               gpuMs: var float32): int32 =
+  if not mkBenchEventsCreated:
+    mkBenchEvent0 = hippoEventCreate()
+    mkBenchEvent1 = hippoEventCreate()
+    mkBenchEventsCreated = true
+  hippoEventRecord(mkBenchEvent0, mkStream)
+  forwardDecodeGpu(token, cache.curLen)
+  gpuArgmax(mkBuf.argmaxResult, mkBuf.logits, ModelCfg.nVocab)
+  hippoEventRecord(mkBenchEvent1, mkStream)
+  hippoStreamSynchronize(mkStream)
+  gpuMs = hippoEventElapsedTime(mkBenchEvent0, mkBenchEvent1)
   var tokenId: cint
   hippoMemcpy(addr tokenId, mkBuf.argmaxResult, sizeof(cint), HippoMemcpyDeviceToHost)
   inc cache.curLen

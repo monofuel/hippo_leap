@@ -95,9 +95,10 @@ proc cmdBench*(args: seq[string]) =
     discard generate(ctx, prompt, maxTokens)
 
   echo ""
-  echo " Run  Tokens  Time(ms)    tok/s"
+  echo " Run  Tokens  Time(ms)   tok/s   GPU(ms)  gpu tok/s"
 
   var toksSec: seq[float64]
+  var gpuToksSec: seq[float64]
 
   for r in 0 ..< runs:
     let res = generate(ctx, prompt, maxTokens)
@@ -105,23 +106,31 @@ proc cmdBench*(args: seq[string]) =
       float64(res.completionTokens) / (res.elapsedMs / 1000.0)
     else:
       0.0
+    let decodeTokens = res.completionTokens - 1
+    let gpuTps = if res.gpuMs > 0 and decodeTokens > 0:
+      float64(decodeTokens) / (res.gpuMs / 1000.0)
+    else:
+      0.0
     toksSec.add(tps)
-    echo &"{r + 1:>4}  {res.completionTokens:>6}  {res.elapsedMs:>9.1f}  {tps:>7.1f}"
+    gpuToksSec.add(gpuTps)
+    echo &"{r + 1:>4}  {res.completionTokens:>6}  {res.elapsedMs:>9.1f}  {tps:>6.1f}  {res.gpuMs:>8.1f}  {gpuTps:>9.1f}"
 
-  if toksSec.len > 0:
+  proc statsLine(label: string, data: seq[float64]): string =
+    if data.len == 0: return ""
     var sum = 0.0
-    var minVal = toksSec[0]
-    var maxVal = toksSec[0]
-    for v in toksSec:
+    var minVal = data[0]
+    var maxVal = data[0]
+    for v in data:
       sum += v
       if v < minVal: minVal = v
       if v > maxVal: maxVal = v
-    let mean = sum / float64(toksSec.len)
+    let mean = sum / float64(data.len)
     var variance = 0.0
-    for v in toksSec:
+    for v in data:
       variance += (v - mean) * (v - mean)
-    let stddev = sqrt(variance / float64(toksSec.len))
-    echo ""
-    echo &"Mean: {mean:.2f} ± {stddev:.2f} tok/s"
-    echo &"Min:  {minVal:.1f} tok/s"
-    echo &"Max:  {maxVal:.1f} tok/s"
+    let stddev = sqrt(variance / float64(data.len))
+    &"{label}: {mean:.2f} ± {stddev:.2f} tok/s  (min {minVal:.1f}, max {maxVal:.1f})"
+
+  echo ""
+  echo statsLine("Wall", toksSec)
+  echo statsLine("GPU ", gpuToksSec)
