@@ -613,6 +613,46 @@ proc storeKVPairKernel(kCache: ptr cfloat, kSrc: ptr cfloat,
     kc[tid * cacheCols + pos] = ks[tid]
     vc[tid * cacheCols + pos] = vs[tid]
 
+proc ropeAndKVStoreKernel(q: ptr cfloat, k: ptr cfloat,
+                          theta: ptr cfloat,
+                          kCache: ptr cfloat, vSrc: ptr cfloat,
+                          vCache: ptr cfloat,
+                          nHeadQ: cint, nHeadK: cint, headDim: cint,
+                          ropeDim: cint, kvDim: cint,
+                          pos: cint, cacheCols: cint) {.hippoGlobal.} =
+  let tid = cint(threadIdx.x)
+  let thetaArr = cast[ptr UncheckedArray[cfloat]](theta)
+  let halfRope = ropeDim div 2
+  let totalPairs = (nHeadQ + nHeadK) * halfRope
+  var i = tid
+  while i < totalPairs:
+    let isK = i >= nHeadQ * halfRope
+    let head = if isK: (i - nHeadQ * halfRope) div halfRope
+               else: i div halfRope
+    let pairIdx = if isK: (i - nHeadQ * halfRope) mod halfRope
+                  else: i mod halfRope
+    let basePtr = if isK: cast[ptr UncheckedArray[cfloat]](k)
+                  else: cast[ptr UncheckedArray[cfloat]](q)
+    let offset = head * headDim + pairIdx
+    let freq = thetaArr[pairIdx] * cfloat(pos)
+    let cosVal = cosf(freq)
+    let sinVal = sinf(freq)
+    let v0 = basePtr[offset]
+    let v1 = basePtr[offset + halfRope]
+    basePtr[offset] = v0 * cosVal - v1 * sinVal
+    basePtr[offset + halfRope] = v0 * sinVal + v1 * cosVal
+    i = i + cint(blockDim.x)
+  hippoSyncthreads()
+  i = tid
+  while i < kvDim:
+    let kc = cast[ptr UncheckedArray[cfloat]](kCache)
+    let vc = cast[ptr UncheckedArray[cfloat]](vCache)
+    let ks = cast[ptr UncheckedArray[cfloat]](k)
+    let vs = cast[ptr UncheckedArray[cfloat]](vSrc)
+    kc[i * cacheCols + pos] = ks[i]
+    vc[i * cacheCols + pos] = vs[i]
+    i = i + cint(blockDim.x)
+
 proc attentionDecodeKernel(dst: ptr cfloat, q: ptr cfloat,
                            kCache: ptr cfloat, vCache: ptr cfloat,
                            nHead: cint, nHeadKv: cint, headDim: cint,
@@ -1580,6 +1620,25 @@ proc gpuStoreKVPair(kCache, kSrc, vCache, vSrc: pointer, pos, cacheCols: int) =
     stream = mkStream,
     args = hippoArgs(kcP, ksP, vcP, vsP, kvd, cc, p))
 
+proc gpuRopeAndKVStore(q, k, theta, kCache, vSrc, vCache: pointer, pos, cacheCols: int) =
+  var qP = cast[ptr cfloat](q)
+  var kP = cast[ptr cfloat](k)
+  var tP = cast[ptr cfloat](theta)
+  var kcP = cast[ptr cfloat](kCache)
+  var vsP = cast[ptr cfloat](vSrc)
+  var vcP = cast[ptr cfloat](vCache)
+  var nHQ = cint(ModelCfg.nHead)
+  var nHK = cint(ModelCfg.nHeadKv)
+  var hDim = cint(ModelCfg.headDim)
+  var rDim = cint(ModelCfg.ropeDim)
+  var kvd = cint(KvDim)
+  var p = cint(pos)
+  var cc = cint(cacheCols)
+  hippoLaunchKernel(ropeAndKVStoreKernel,
+    gridDim = newDim3(1), blockDim = block1d(),
+    stream = mkStream,
+    args = hippoArgs(qP, kP, tP, kcP, vsP, vcP, nHQ, nHK, hDim, rDim, kvd, p, cc))
+
 proc gpuAttentionDecode(dst, q, kCache, vCache: pointer, curLen, cacheCols: int) =
   var dstP = cast[ptr cfloat](dst)
   var qP = cast[ptr cfloat](q)
@@ -2126,8 +2185,8 @@ proc forwardDecodeIndividual(token: int32, curLen: int): seq[float32] =
           gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wq, ModelCfg.nEmb, QDim)
           gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wk, ModelCfg.nEmb, KvDim)
         gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
-      gpuRopeQKDecode(mkBuf.scratch0, mkBuf.scratch1, mkWeights.ropeTheta, curLen)
-      gpuStoreKVPair(kvK, mkBuf.scratch1, kvV, mkBuf.scratch2, curLen, cacheCols)
+      gpuRopeAndKVStore(mkBuf.scratch0, mkBuf.scratch1, mkWeights.ropeTheta,
+                        kvK, mkBuf.scratch2, kvV, curLen, cacheCols)
       gpuAttentionDecode(mkBuf.scratch1, mkBuf.scratch0, kvK, kvV, curLen + 1, cacheCols)
       gpuLinear(mkBuf.scratch0, mkBuf.scratch1, lw.wo, QDim, ModelCfg.nEmb)
 
