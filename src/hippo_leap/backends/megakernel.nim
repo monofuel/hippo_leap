@@ -511,6 +511,91 @@ proc linearQ2KLdsKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
   if laneId == 0'i32:
     outArr[row] = acc
 
+proc linearQ2KDualLdsKernel(dst1: ptr cfloat, dst2: ptr cfloat,
+                            x: ptr cfloat, w1: ptr uint8, w2: ptr uint8,
+                            inDim: cint, outDim: cint) {.hippoGlobal.} =
+  var sAct {.hippoShared.}: array[2048, cfloat]
+  let tid = cint(threadIdx.x)
+  let warpId = tid div cint(mkc.WarpSize)
+  let laneId = tid mod cint(mkc.WarpSize)
+  let warpsPerBlock = cint(blockDim.x) div cint(mkc.WarpSize)
+  let xArr = cast[ptr UncheckedArray[cfloat]](x)
+  var i = tid
+  while i < inDim:
+    sAct[i] = xArr[i]
+    i = i + cint(blockDim.x)
+  hippoSyncthreads()
+  let row = cint(blockIdx.x) * warpsPerBlock + warpId
+  if row >= outDim: return
+  let outArr1 = cast[ptr UncheckedArray[cfloat]](dst1)
+  let outArr2 = cast[ptr UncheckedArray[cfloat]](dst2)
+  let nBlocksPerRow = inDim div cint(QK_K)
+  let rowSizeBytes = nBlocksPerRow * cint(BlockQ2KSize)
+  let rowBase = row * rowSizeBytes
+  let sub = (laneId shr 4'i32) and 1'i32
+  let qsOff0 = 16'i32 + sub * 16'i32 + (laneId and 15'i32)
+  let qsOff1 = 48'i32 + sub * 16'i32 + (laneId and 15'i32)
+  var acc1, acc2: cfloat = 0.0
+  var blkIdx: cint = 0
+  let wArr1 = cast[ptr UncheckedArray[uint8]](w1)
+  let wArr2 = cast[ptr UncheckedArray[uint8]](w2)
+  while blkIdx < nBlocksPerRow:
+    let eb = blkIdx * cint(QK_K)
+    let a0 = sAct[eb + laneId]
+    let a1 = sAct[eb + laneId + 32'i32]
+    let a2 = sAct[eb + laneId + 64'i32]
+    let a3 = sAct[eb + laneId + 96'i32]
+    let a4 = sAct[eb + laneId + 128'i32]
+    let a5 = sAct[eb + laneId + 160'i32]
+    let a6 = sAct[eb + laneId + 192'i32]
+    let a7 = sAct[eb + laneId + 224'i32]
+    block:
+      let bs = rowBase + blkIdx * cint(BlockQ2KSize)
+      let dRaw = uint16(wArr1[bs + 80'i32]) or (uint16(wArr1[bs + 81'i32]) shl 8)
+      let dmRaw = uint16(wArr1[bs + 82'i32]) or (uint16(wArr1[bs + 83'i32]) shl 8)
+      let d = hippoHalfToFloat(dRaw)
+      let dm = hippoHalfToFloat(dmRaw)
+      let qb0 = wArr1[bs + qsOff0]
+      let qb1 = wArr1[bs + qsOff1]
+      acc1 = acc1 + (d * cfloat(wArr1[bs + sub] and 0x0F'u8) * cfloat(qb0 and 3'u8) - dm * cfloat(wArr1[bs + sub] shr 4)) * a0
+      acc1 = acc1 + (d * cfloat(wArr1[bs + 2'i32 + sub] and 0x0F'u8) * cfloat((qb0 shr 2) and 3'u8) - dm * cfloat(wArr1[bs + 2'i32 + sub] shr 4)) * a1
+      acc1 = acc1 + (d * cfloat(wArr1[bs + 4'i32 + sub] and 0x0F'u8) * cfloat((qb0 shr 4) and 3'u8) - dm * cfloat(wArr1[bs + 4'i32 + sub] shr 4)) * a2
+      acc1 = acc1 + (d * cfloat(wArr1[bs + 6'i32 + sub] and 0x0F'u8) * cfloat((qb0 shr 6) and 3'u8) - dm * cfloat(wArr1[bs + 6'i32 + sub] shr 4)) * a3
+      acc1 = acc1 + (d * cfloat(wArr1[bs + 8'i32 + sub] and 0x0F'u8) * cfloat(qb1 and 3'u8) - dm * cfloat(wArr1[bs + 8'i32 + sub] shr 4)) * a4
+      acc1 = acc1 + (d * cfloat(wArr1[bs + 10'i32 + sub] and 0x0F'u8) * cfloat((qb1 shr 2) and 3'u8) - dm * cfloat(wArr1[bs + 10'i32 + sub] shr 4)) * a5
+      acc1 = acc1 + (d * cfloat(wArr1[bs + 12'i32 + sub] and 0x0F'u8) * cfloat((qb1 shr 4) and 3'u8) - dm * cfloat(wArr1[bs + 12'i32 + sub] shr 4)) * a6
+      acc1 = acc1 + (d * cfloat(wArr1[bs + 14'i32 + sub] and 0x0F'u8) * cfloat((qb1 shr 6) and 3'u8) - dm * cfloat(wArr1[bs + 14'i32 + sub] shr 4)) * a7
+    block:
+      let bs = rowBase + blkIdx * cint(BlockQ2KSize)
+      let dRaw = uint16(wArr2[bs + 80'i32]) or (uint16(wArr2[bs + 81'i32]) shl 8)
+      let dmRaw = uint16(wArr2[bs + 82'i32]) or (uint16(wArr2[bs + 83'i32]) shl 8)
+      let d = hippoHalfToFloat(dRaw)
+      let dm = hippoHalfToFloat(dmRaw)
+      let qb0 = wArr2[bs + qsOff0]
+      let qb1 = wArr2[bs + qsOff1]
+      acc2 = acc2 + (d * cfloat(wArr2[bs + sub] and 0x0F'u8) * cfloat(qb0 and 3'u8) - dm * cfloat(wArr2[bs + sub] shr 4)) * a0
+      acc2 = acc2 + (d * cfloat(wArr2[bs + 2'i32 + sub] and 0x0F'u8) * cfloat((qb0 shr 2) and 3'u8) - dm * cfloat(wArr2[bs + 2'i32 + sub] shr 4)) * a1
+      acc2 = acc2 + (d * cfloat(wArr2[bs + 4'i32 + sub] and 0x0F'u8) * cfloat((qb0 shr 4) and 3'u8) - dm * cfloat(wArr2[bs + 4'i32 + sub] shr 4)) * a2
+      acc2 = acc2 + (d * cfloat(wArr2[bs + 6'i32 + sub] and 0x0F'u8) * cfloat((qb0 shr 6) and 3'u8) - dm * cfloat(wArr2[bs + 6'i32 + sub] shr 4)) * a3
+      acc2 = acc2 + (d * cfloat(wArr2[bs + 8'i32 + sub] and 0x0F'u8) * cfloat(qb1 and 3'u8) - dm * cfloat(wArr2[bs + 8'i32 + sub] shr 4)) * a4
+      acc2 = acc2 + (d * cfloat(wArr2[bs + 10'i32 + sub] and 0x0F'u8) * cfloat((qb1 shr 2) and 3'u8) - dm * cfloat(wArr2[bs + 10'i32 + sub] shr 4)) * a5
+      acc2 = acc2 + (d * cfloat(wArr2[bs + 12'i32 + sub] and 0x0F'u8) * cfloat((qb1 shr 4) and 3'u8) - dm * cfloat(wArr2[bs + 12'i32 + sub] shr 4)) * a6
+      acc2 = acc2 + (d * cfloat(wArr2[bs + 14'i32 + sub] and 0x0F'u8) * cfloat((qb1 shr 6) and 3'u8) - dm * cfloat(wArr2[bs + 14'i32 + sub] shr 4)) * a7
+    blkIdx = blkIdx + 1'i32
+  acc1 = acc1 + hippoShflDown(acc1, 16)
+  acc1 = acc1 + hippoShflDown(acc1, 8)
+  acc1 = acc1 + hippoShflDown(acc1, 4)
+  acc1 = acc1 + hippoShflDown(acc1, 2)
+  acc1 = acc1 + hippoShflDown(acc1, 1)
+  acc2 = acc2 + hippoShflDown(acc2, 16)
+  acc2 = acc2 + hippoShflDown(acc2, 8)
+  acc2 = acc2 + hippoShflDown(acc2, 4)
+  acc2 = acc2 + hippoShflDown(acc2, 2)
+  acc2 = acc2 + hippoShflDown(acc2, 1)
+  if laneId == 0'i32:
+    outArr1[row] = acc1
+    outArr2[row] = acc2
+
 proc linearQ3KLdsKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
                         inDim: cint, outDim: cint) {.hippoGlobal.} =
   var sAct {.hippoShared.}: array[2048, cfloat]
@@ -1368,6 +1453,21 @@ proc gpuLinearQ2KLds(dst, x, w: pointer, inDim, outDim: int) =
     stream = mkStream,
     args = hippoArgs(dstP, xP, wP, iDim, oDim))
 
+proc gpuLinearQ2KDualLds(dst1, dst2, x, w1, w2: pointer, inDim, outDim: int) =
+  var dst1P = cast[ptr cfloat](dst1)
+  var dst2P = cast[ptr cfloat](dst2)
+  var xP = cast[ptr cfloat](x)
+  var w1P = cast[ptr uint8](w1)
+  var w2P = cast[ptr uint8](w2)
+  var iDim = cint(inDim)
+  var oDim = cint(outDim)
+  let warpsPerBlock = BlockSize div mkc.WarpSize
+  let gridBlocks = (outDim + warpsPerBlock - 1) div warpsPerBlock
+  hippoLaunchKernel(linearQ2KDualLdsKernel,
+    gridDim = newDim3(gridBlocks.uint32), blockDim = block1d(),
+    stream = mkStream,
+    args = hippoArgs(dst1P, dst2P, xP, w1P, w2P, iDim, oDim))
+
 proc gpuLinearQ3KLds(dst, x, w: pointer, inDim, outDim: int) =
   var dstP = cast[ptr cfloat](dst)
   var xP = cast[ptr cfloat](x)
@@ -1649,16 +1749,24 @@ proc forwardDecodeIndividual(token: int32, curLen: int): seq[float32] =
       gpuRmsNorm(mkBuf.act1, mkBuf.act0, lw.attnNorm)
 
     gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wq, ModelCfg.nEmb, QDim)
-    gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wk, ModelCfg.nEmb, KvDim)
-    gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
+    if lw.wk.qtype == GgmlTypeQ2K.int32 and lw.wv.qtype == GgmlTypeQ2K.int32:
+      gpuLinearQ2KDualLds(mkBuf.scratch1, mkBuf.scratch2, mkBuf.act1,
+                          lw.wk.p, lw.wv.p, ModelCfg.nEmb, KvDim)
+    else:
+      gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wk, ModelCfg.nEmb, KvDim)
+      gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
     gpuRopeQKDecode(mkBuf.scratch0, mkBuf.scratch1, mkWeights.ropeTheta, curLen)
     gpuStoreKVPair(kvK, mkBuf.scratch1, kvV, mkBuf.scratch2, curLen, cacheCols)
     gpuAttentionDecode(mkBuf.scratch1, mkBuf.scratch0, kvK, kvV, curLen + 1, cacheCols)
     gpuLinear(mkBuf.scratch0, mkBuf.scratch1, lw.wo, QDim, ModelCfg.nEmb)
 
     gpuResidualRmsNorm(mkBuf.act1, mkBuf.act0, mkBuf.scratch0, lw.ffnNorm)
-    gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
-    gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
+    if lw.wGate.qtype == GgmlTypeQ2K.int32 and lw.wUp.qtype == GgmlTypeQ2K.int32 and ModelCfg.nEmb <= 2048:
+      gpuLinearQ2KDualLds(mkBuf.scratch0, mkBuf.scratch1, mkBuf.act1,
+                          lw.wGate.p, lw.wUp.p, ModelCfg.nEmb, ModelCfg.ffnDim)
+    else:
+      gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
+      gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
     gpuSiluMul(mkBuf.scratch0, mkBuf.scratch1, ModelCfg.ffnDim)
     gpuLinear(mkBuf.scratch1, mkBuf.scratch0, lw.wDown, ModelCfg.ffnDim, ModelCfg.nEmb)
 
@@ -1694,16 +1802,24 @@ proc forwardDecodeGraphBody() =
       gpuRmsNorm(mkBuf.act1, mkBuf.act0, lw.attnNorm)
 
     gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wq, ModelCfg.nEmb, QDim)
-    gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wk, ModelCfg.nEmb, KvDim)
-    gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
+    if lw.wk.qtype == GgmlTypeQ2K.int32 and lw.wv.qtype == GgmlTypeQ2K.int32:
+      gpuLinearQ2KDualLds(mkBuf.scratch1, mkBuf.scratch2, mkBuf.act1,
+                          lw.wk.p, lw.wv.p, ModelCfg.nEmb, KvDim)
+    else:
+      gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wk, ModelCfg.nEmb, KvDim)
+      gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
     gpuRopeQKDecodeG(mkBuf.scratch0, mkBuf.scratch1, mkWeights.ropeTheta)
     gpuStoreKVPairG(kvK, mkBuf.scratch1, kvV, mkBuf.scratch2, cacheCols)
     gpuAttentionDecodeG(mkBuf.scratch1, mkBuf.scratch0, kvK, kvV, cacheCols)
     gpuLinear(mkBuf.scratch0, mkBuf.scratch1, lw.wo, QDim, ModelCfg.nEmb)
 
     gpuResidualRmsNorm(mkBuf.act1, mkBuf.act0, mkBuf.scratch0, lw.ffnNorm)
-    gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
-    gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
+    if lw.wGate.qtype == GgmlTypeQ2K.int32 and lw.wUp.qtype == GgmlTypeQ2K.int32 and ModelCfg.nEmb <= 2048:
+      gpuLinearQ2KDualLds(mkBuf.scratch0, mkBuf.scratch1, mkBuf.act1,
+                          lw.wGate.p, lw.wUp.p, ModelCfg.nEmb, ModelCfg.ffnDim)
+    else:
+      gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
+      gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
     gpuSiluMul(mkBuf.scratch0, mkBuf.scratch1, ModelCfg.ffnDim)
     gpuLinear(mkBuf.scratch1, mkBuf.scratch0, lw.wDown, ModelCfg.ffnDim, ModelCfg.nEmb)
 
