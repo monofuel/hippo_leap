@@ -56,6 +56,7 @@ type
     scratch2: pointer       # [MaxDim] f32
     actQ8: pointer          # Q8_1 quantized activation buffer [(MaxDim/32)*36 bytes]
     logits: pointer         # [nVocab] f32
+    argmaxResult: pointer   # [1] cint — GPU-side argmax result
     kvK: array[ModelCfg.nLayers, pointer]  # [KvDim, maxLen] f32
     kvV: array[ModelCfg.nLayers, pointer]
 
@@ -1479,6 +1480,56 @@ proc siluMulKernel(gate: ptr cfloat, up: ptr cfloat,
     let x = g[tid]
     g[tid] = (x / (1.0f + expf(-x))) * u[tid]
 
+template warpReduceMaxIdx(val: var cfloat, idx: var cint) {.dirty.} =
+  block:
+    var ov: cfloat
+    var oi: cint
+    ov = hippoShflDown(val, 16); oi = hippoShflDown(idx, 16)
+    if ov > val: val = ov; idx = oi
+    ov = hippoShflDown(val, 8); oi = hippoShflDown(idx, 8)
+    if ov > val: val = ov; idx = oi
+    ov = hippoShflDown(val, 4); oi = hippoShflDown(idx, 4)
+    if ov > val: val = ov; idx = oi
+    ov = hippoShflDown(val, 2); oi = hippoShflDown(idx, 2)
+    if ov > val: val = ov; idx = oi
+    ov = hippoShflDown(val, 1); oi = hippoShflDown(idx, 1)
+    if ov > val: val = ov; idx = oi
+
+proc argmaxKernel(resultPtr: ptr cint, src: ptr cfloat, n: cint) {.hippoGlobal.} =
+  var sMaxVal {.hippoShared.}: array[8, cfloat]
+  var sMaxIdx {.hippoShared.}: array[8, cint]
+  let tid = cint(threadIdx.x)
+  let warpId = tid div 32'i32
+  let laneId = tid mod 32'i32
+  let arr = cast[ptr UncheckedArray[cfloat]](src)
+  var bestVal: cfloat = -1e30f
+  var bestIdx: cint = 0
+  var i = tid
+  while i < n:
+    let v = arr[i]
+    if v > bestVal:
+      bestVal = v
+      bestIdx = i
+    i = i + cint(blockDim.x)
+  warpReduceMaxIdx(bestVal, bestIdx)
+  if laneId == 0'i32:
+    sMaxVal[warpId] = bestVal
+    sMaxIdx[warpId] = bestIdx
+  hippoSyncthreads()
+  if warpId == 0'i32 and laneId < (cint(blockDim.x) div 32'i32):
+    bestVal = sMaxVal[laneId]
+    bestIdx = sMaxIdx[laneId]
+    var ov: cfloat
+    var oi: cint
+    ov = hippoShflDown(bestVal, 4); oi = hippoShflDown(bestIdx, 4)
+    if ov > bestVal: bestVal = ov; bestIdx = oi
+    ov = hippoShflDown(bestVal, 2); oi = hippoShflDown(bestIdx, 2)
+    if ov > bestVal: bestVal = ov; bestIdx = oi
+    ov = hippoShflDown(bestVal, 1); oi = hippoShflDown(bestIdx, 1)
+    if ov > bestVal: bestVal = ov; bestIdx = oi
+    if laneId == 0'i32:
+      cast[ptr cint](resultPtr)[] = bestIdx
+
 # ---------------------------------------------------------------------------
 # Graph-compatible kernel variants (read variable args from device config)
 # ---------------------------------------------------------------------------
@@ -2067,6 +2118,15 @@ proc gpuSiluMul(gate, up: pointer, dim: int) =
     stream = mkStream,
     args = hippoArgs(gP, uP, d))
 
+proc gpuArgmax(result, src: pointer, n: int) =
+  var rP = cast[ptr cint](result)
+  var sP = cast[ptr cfloat](src)
+  var nC = cint(n)
+  hippoLaunchKernel(argmaxKernel,
+    gridDim = newDim3(1'u32), blockDim = block1d(),
+    stream = mkStream,
+    args = hippoArgs(rP, sP, nC))
+
 proc gpuAdd(dst, src: pointer, dim: int) =
   var dstP = cast[ptr cfloat](dst)
   var srcP = cast[ptr cfloat](src)
@@ -2471,13 +2531,16 @@ proc loadModelBackend*(m: var Model, hp: HParams) =
                 hippoMalloc(MaxQ8Blocks * Q8_1BlockSize),
                 hippoMalloc(ModelCfg.nVocab * sizeof(float32))]:
     mkBufAllocs.add(alloc)
-  mkBuf.act0 = mkBufAllocs[^7].p
-  mkBuf.act1 = mkBufAllocs[^6].p
-  mkBuf.scratch0 = mkBufAllocs[^5].p
-  mkBuf.scratch1 = mkBufAllocs[^4].p
-  mkBuf.scratch2 = mkBufAllocs[^3].p
-  mkBuf.actQ8 = mkBufAllocs[^2].p
-  mkBuf.logits = mkBufAllocs[^1].p
+  let argmaxAlloc = hippoMalloc(sizeof(cint))
+  mkBufAllocs.add(argmaxAlloc)
+  mkBuf.act0 = mkBufAllocs[^8].p
+  mkBuf.act1 = mkBufAllocs[^7].p
+  mkBuf.scratch0 = mkBufAllocs[^6].p
+  mkBuf.scratch1 = mkBufAllocs[^5].p
+  mkBuf.scratch2 = mkBufAllocs[^4].p
+  mkBuf.actQ8 = mkBufAllocs[^3].p
+  mkBuf.logits = mkBufAllocs[^2].p
+  mkBuf.argmaxResult = mkBufAllocs[^1].p
 
   # KV cache
   mkMaxLen = m.hparams.nCtx
@@ -2544,7 +2607,8 @@ when not defined(useIndividualLaunches):
     hippoMemcpy(addr result[0], mkBuf.logits, ModelCfg.nVocab * sizeof(float32),
                 HippoMemcpyDeviceToHost)
 
-proc forwardDecodeIndividual(token: int32, curLen: int): seq[float32] =
+proc forwardDecodeGpu(token: int32, curLen: int) =
+  ## Dispatch all GPU kernels for one decode step. Does NOT sync or copy logits.
   let cacheCols = mkMaxLen
 
   when defined(debugMegakernel):
@@ -2665,14 +2729,16 @@ proc forwardDecodeIndividual(token: int32, curLen: int): seq[float32] =
     hippoEventDestroy(profStart)
     hippoEventDestroy(profEnd)
 
-  hippoStreamSynchronize(mkStream)
-
   when defined(profileMegakernel):
+    hippoStreamSynchronize(mkStream)
     let total = tWq + tWk + tWv + tRope + tKV + tAttn + tWo + tNorm + tWgate + tWup + tSilu + tWdown + tResid + tOutput
     echo &"[profile] wq={tWq:.2f} wk={tWk:.2f} wv={tWv:.2f} rope={tRope:.2f} kv={tKV:.2f} attn={tAttn:.2f} wo={tWo:.2f} norm={tNorm:.2f} wGate={tWgate:.2f} wUp={tWup:.2f} silu={tSilu:.2f} wDown={tWdown:.2f} resid={tResid:.2f} output={tOutput:.2f} total={total:.2f}ms"
     hippoEventDestroy(profE0)
     hippoEventDestroy(profE1)
 
+proc forwardDecodeIndividual(token: int32, curLen: int): seq[float32] =
+  forwardDecodeGpu(token, curLen)
+  hippoStreamSynchronize(mkStream)
   result = newSeq[float32](ModelCfg.nVocab)
   hippoMemcpy(addr result[0], mkBuf.logits, ModelCfg.nVocab * sizeof(float32),
               HippoMemcpyDeviceToHost)
@@ -2773,11 +2839,10 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
   result = Tensor(shape: @[1, ModelCfg.nVocab], data: logits)
 
 proc forwardDecodeToken*(m: var Model, token: int32, cache: var KvCache): int32 =
-  let logits = forwardDecodeInternal(token, cache.curLen)
+  forwardDecodeGpu(token, cache.curLen)
+  gpuArgmax(mkBuf.argmaxResult, mkBuf.logits, ModelCfg.nVocab)
+  hippoStreamSynchronize(mkStream)
+  var tokenId: cint
+  hippoMemcpy(addr tokenId, mkBuf.argmaxResult, sizeof(cint), HippoMemcpyDeviceToHost)
   inc cache.curLen
-  var maxVal = logits[0]
-  result = 0
-  for i in 1 ..< logits.len:
-    if logits[i] > maxVal:
-      maxVal = logits[i]
-      result = int32(i)
+  result = int32(tokenId)
