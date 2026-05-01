@@ -179,8 +179,6 @@ proc addKernel(dst: ptr cfloat, src: ptr cfloat, dim: cint) {.hippoGlobal.} =
 
 proc linearQ2KWarpKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
                          inDim: cint, outDim: cint) {.hippoGlobal.} =
-  ## Warp-per-row Q2K GEMV.
-  ## Q2K block = [scales:16][qs:64][d:2][dmin:2] = 84 bytes.
   let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
   let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
   let warpsPerBlock = cint(blockDim.x) div cint(mkc.WarpSize)
@@ -1497,7 +1495,7 @@ proc gpuLinearQ8_0Lds(dst, x, w: pointer, inDim, outDim: int) =
 proc gpuLinear(dst, x: pointer, w: MkWeight, inDim, outDim: int) =
   if inDim <= ModelCfg.nEmb:
     case w.qtype
-    of GgmlTypeQ2K.int32: gpuLinearQ2KLds(dst, x, w.p, inDim, outDim)
+    of GgmlTypeQ2K.int32: gpuLinearQ2K(dst, x, w.p, inDim, outDim)
     of GgmlTypeQ3K.int32: gpuLinearQ3KLds(dst, x, w.p, inDim, outDim)
     of GgmlTypeQ8_0.int32: gpuLinearQ8_0Lds(dst, x, w.p, inDim, outDim)
     of GgmlTypeF32.int32: gpuLinearF32(dst, x, w.p, inDim, outDim)
@@ -1749,24 +1747,16 @@ proc forwardDecodeIndividual(token: int32, curLen: int): seq[float32] =
       gpuRmsNorm(mkBuf.act1, mkBuf.act0, lw.attnNorm)
 
     gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wq, ModelCfg.nEmb, QDim)
-    if lw.wk.qtype == GgmlTypeQ2K.int32 and lw.wv.qtype == GgmlTypeQ2K.int32:
-      gpuLinearQ2KDualLds(mkBuf.scratch1, mkBuf.scratch2, mkBuf.act1,
-                          lw.wk.p, lw.wv.p, ModelCfg.nEmb, KvDim)
-    else:
-      gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wk, ModelCfg.nEmb, KvDim)
-      gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
+    gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wk, ModelCfg.nEmb, KvDim)
+    gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
     gpuRopeQKDecode(mkBuf.scratch0, mkBuf.scratch1, mkWeights.ropeTheta, curLen)
     gpuStoreKVPair(kvK, mkBuf.scratch1, kvV, mkBuf.scratch2, curLen, cacheCols)
     gpuAttentionDecode(mkBuf.scratch1, mkBuf.scratch0, kvK, kvV, curLen + 1, cacheCols)
     gpuLinear(mkBuf.scratch0, mkBuf.scratch1, lw.wo, QDim, ModelCfg.nEmb)
 
     gpuResidualRmsNorm(mkBuf.act1, mkBuf.act0, mkBuf.scratch0, lw.ffnNorm)
-    if lw.wGate.qtype == GgmlTypeQ2K.int32 and lw.wUp.qtype == GgmlTypeQ2K.int32 and ModelCfg.nEmb <= 2048:
-      gpuLinearQ2KDualLds(mkBuf.scratch0, mkBuf.scratch1, mkBuf.act1,
-                          lw.wGate.p, lw.wUp.p, ModelCfg.nEmb, ModelCfg.ffnDim)
-    else:
-      gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
-      gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
+    gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
+    gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
     gpuSiluMul(mkBuf.scratch0, mkBuf.scratch1, ModelCfg.ffnDim)
     gpuLinear(mkBuf.scratch1, mkBuf.scratch0, lw.wDown, ModelCfg.ffnDim, ModelCfg.nEmb)
 
@@ -1802,24 +1792,16 @@ proc forwardDecodeGraphBody() =
       gpuRmsNorm(mkBuf.act1, mkBuf.act0, lw.attnNorm)
 
     gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wq, ModelCfg.nEmb, QDim)
-    if lw.wk.qtype == GgmlTypeQ2K.int32 and lw.wv.qtype == GgmlTypeQ2K.int32:
-      gpuLinearQ2KDualLds(mkBuf.scratch1, mkBuf.scratch2, mkBuf.act1,
-                          lw.wk.p, lw.wv.p, ModelCfg.nEmb, KvDim)
-    else:
-      gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wk, ModelCfg.nEmb, KvDim)
-      gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
+    gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wk, ModelCfg.nEmb, KvDim)
+    gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
     gpuRopeQKDecodeG(mkBuf.scratch0, mkBuf.scratch1, mkWeights.ropeTheta)
     gpuStoreKVPairG(kvK, mkBuf.scratch1, kvV, mkBuf.scratch2, cacheCols)
     gpuAttentionDecodeG(mkBuf.scratch1, mkBuf.scratch0, kvK, kvV, cacheCols)
     gpuLinear(mkBuf.scratch0, mkBuf.scratch1, lw.wo, QDim, ModelCfg.nEmb)
 
     gpuResidualRmsNorm(mkBuf.act1, mkBuf.act0, mkBuf.scratch0, lw.ffnNorm)
-    if lw.wGate.qtype == GgmlTypeQ2K.int32 and lw.wUp.qtype == GgmlTypeQ2K.int32 and ModelCfg.nEmb <= 2048:
-      gpuLinearQ2KDualLds(mkBuf.scratch0, mkBuf.scratch1, mkBuf.act1,
-                          lw.wGate.p, lw.wUp.p, ModelCfg.nEmb, ModelCfg.ffnDim)
-    else:
-      gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
-      gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
+    gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
+    gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
     gpuSiluMul(mkBuf.scratch0, mkBuf.scratch1, ModelCfg.ffnDim)
     gpuLinear(mkBuf.scratch1, mkBuf.scratch0, lw.wDown, ModelCfg.ffnDim, ModelCfg.nEmb)
 
