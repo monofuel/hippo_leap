@@ -376,7 +376,58 @@ proc linearQ3KWarpKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
   let hmOff = sub * 16'i32 + (tid and 15'i32)
 
   var acc: cfloat = 0.0
+  var acc2: cfloat = 0.0
   var blkIdx: cint = 0
+  while blkIdx + 1'i32 < nBlocksPerRow:
+    let bs0 = rowBase + blkIdx * 110'i32
+    let bs1 = rowBase + (blkIdx + 1'i32) * 110'i32
+    let eb0 = blkIdx * 256'i32
+    let eb1 = (blkIdx + 1'i32) * 256'i32
+    let dRaw0 = uint16(wArr[bs0 + 108'i32]) or (uint16(wArr[bs0 + 109'i32]) shl 8)
+    let dRaw1 = uint16(wArr[bs1 + 108'i32]) or (uint16(wArr[bs1 + 109'i32]) shl 8)
+    let dAll0 = hippoHalfToFloat(dRaw0)
+    let dAll1 = hippoHalfToFloat(dRaw1)
+    let qb0a = wArr[bs0 + qsOff0]
+    let qb1a = wArr[bs0 + qsOff1]
+    let hmByte0 = cint(wArr[bs0 + hmOff])
+    let qb0b = wArr[bs1 + qsOff0]
+    let qb1b = wArr[bs1 + qsOff1]
+    let hmByte1 = cint(wArr[bs1 + hmOff])
+
+    template q3kElem2(accVar: var cfloat, bsV, dAllV: untyped, scaleIdx: cint, qByte: untyped, qShift: cint, hmByteV: untyped, hmBitPos, ebV, xOff: cint) {.dirty.} =
+      block:
+        let si = scaleIdx
+        let big = si and 3'i32
+        let ai = si shr 2'i32
+        let sByteVal = cint(wArr[bsV + 96'i32 + (ai and 1'i32) * 4'i32 + big])
+        let tByteVal = cint(wArr[bsV + 104'i32 + big])
+        let low = (sByteVal shr ((ai shr 1'i32) * 4'i32)) and 0x0F'i32
+        let high = ((tByteVal shr (ai * 2'i32)) and 0x03'i32) shl 4'i32
+        let scByte = low or high
+        let scSigned = (scByte xor 0x80'i32) - 0x80'i32
+        let qval = cint((qByte shr qShift) and 3)
+        let hm = 4'i32 - ((hmByteV shr hmBitPos) and 1'i32) * 4'i32
+        let intProd = (scSigned - 32'i32) * (qval - hm)
+        accVar = accVar + dAllV * cfloat(intProd) * xArr[ebV + xOff]
+
+    q3kElem2(acc,  bs0, dAll0, sub,            qb0a, 0, hmByte0, 0, eb0, tid)
+    q3kElem2(acc2, bs1, dAll1, sub,            qb0b, 0, hmByte1, 0, eb1, tid)
+    q3kElem2(acc,  bs0, dAll0, 2'i32 + sub,    qb0a, 2, hmByte0, 1, eb0, tid + 32'i32)
+    q3kElem2(acc2, bs1, dAll1, 2'i32 + sub,    qb0b, 2, hmByte1, 1, eb1, tid + 32'i32)
+    q3kElem2(acc,  bs0, dAll0, 4'i32 + sub,    qb0a, 4, hmByte0, 2, eb0, tid + 64'i32)
+    q3kElem2(acc2, bs1, dAll1, 4'i32 + sub,    qb0b, 4, hmByte1, 2, eb1, tid + 64'i32)
+    q3kElem2(acc,  bs0, dAll0, 6'i32 + sub,    qb0a, 6, hmByte0, 3, eb0, tid + 96'i32)
+    q3kElem2(acc2, bs1, dAll1, 6'i32 + sub,    qb0b, 6, hmByte1, 3, eb1, tid + 96'i32)
+    q3kElem2(acc,  bs0, dAll0, 8'i32 + sub,    qb1a, 0, hmByte0, 4, eb0, tid + 128'i32)
+    q3kElem2(acc2, bs1, dAll1, 8'i32 + sub,    qb1b, 0, hmByte1, 4, eb1, tid + 128'i32)
+    q3kElem2(acc,  bs0, dAll0, 10'i32 + sub,   qb1a, 2, hmByte0, 5, eb0, tid + 160'i32)
+    q3kElem2(acc2, bs1, dAll1, 10'i32 + sub,   qb1b, 2, hmByte1, 5, eb1, tid + 160'i32)
+    q3kElem2(acc,  bs0, dAll0, 12'i32 + sub,   qb1a, 4, hmByte0, 6, eb0, tid + 192'i32)
+    q3kElem2(acc2, bs1, dAll1, 12'i32 + sub,   qb1b, 4, hmByte1, 6, eb1, tid + 192'i32)
+    q3kElem2(acc,  bs0, dAll0, 14'i32 + sub,   qb1a, 6, hmByte0, 7, eb0, tid + 224'i32)
+    q3kElem2(acc2, bs1, dAll1, 14'i32 + sub,   qb1b, 6, hmByte1, 7, eb1, tid + 224'i32)
+    blkIdx = blkIdx + 2'i32
+
   while blkIdx < nBlocksPerRow:
     let bs = rowBase + blkIdx * 110'i32
     let eb = blkIdx * 256'i32
@@ -412,6 +463,7 @@ proc linearQ3KWarpKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
     q3kElem(14'i32 + sub,   qb1, 6, 7, tid + 224'i32)
     blkIdx = blkIdx + 1'i32
 
+  acc = acc + acc2
   acc = acc + hippoShflDown(acc, 16)
   acc = acc + hippoShflDown(acc, 8)
   acc = acc + hippoShflDown(acc, 4)
@@ -527,7 +579,58 @@ proc linearQ3KDualWarpKernel(dst1: ptr cfloat, dst2: ptr cfloat, x: ptr cfloat,
   let hmOff = sub * 16'i32 + (tid and 15'i32)
 
   var acc: cfloat = 0.0
+  var acc2: cfloat = 0.0
   var blkIdx: cint = 0
+  while blkIdx + 1'i32 < nBlocksPerRow:
+    let bs0 = rowBase + blkIdx * 110'i32
+    let bs1 = rowBase + (blkIdx + 1'i32) * 110'i32
+    let eb0 = blkIdx * 256'i32
+    let eb1 = (blkIdx + 1'i32) * 256'i32
+    let dRaw0 = uint16(w[bs0 + 108'i32]) or (uint16(w[bs0 + 109'i32]) shl 8)
+    let dRaw1 = uint16(w[bs1 + 108'i32]) or (uint16(w[bs1 + 109'i32]) shl 8)
+    let dAll0 = hippoHalfToFloat(dRaw0)
+    let dAll1 = hippoHalfToFloat(dRaw1)
+    let qb0a = w[bs0 + qsOff0]
+    let qb1a = w[bs0 + qsOff1]
+    let hmByte0 = cint(w[bs0 + hmOff])
+    let qb0b = w[bs1 + qsOff0]
+    let qb1b = w[bs1 + qsOff1]
+    let hmByte1 = cint(w[bs1 + hmOff])
+
+    template q3kElemD(accVar: var cfloat, bsV, dAllV: untyped, scaleIdx: cint, qByte: untyped, qShift: cint, hmByteV: untyped, hmBitPos, ebV, xOff: cint) {.dirty.} =
+      block:
+        let si = scaleIdx
+        let big = si and 3'i32
+        let ai = si shr 2'i32
+        let sByteVal = cint(w[bsV + 96'i32 + (ai and 1'i32) * 4'i32 + big])
+        let tByteVal = cint(w[bsV + 104'i32 + big])
+        let low = (sByteVal shr ((ai shr 1'i32) * 4'i32)) and 0x0F'i32
+        let high = ((tByteVal shr (ai * 2'i32)) and 0x03'i32) shl 4'i32
+        let scByte = low or high
+        let scSigned = (scByte xor 0x80'i32) - 0x80'i32
+        let qval = cint((qByte shr qShift) and 3)
+        let hm = 4'i32 - ((hmByteV shr hmBitPos) and 1'i32) * 4'i32
+        let intProd = (scSigned - 32'i32) * (qval - hm)
+        accVar = accVar + dAllV * cfloat(intProd) * xArr[ebV + xOff]
+
+    q3kElemD(acc,  bs0, dAll0, sub,            qb0a, 0, hmByte0, 0, eb0, tid)
+    q3kElemD(acc2, bs1, dAll1, sub,            qb0b, 0, hmByte1, 0, eb1, tid)
+    q3kElemD(acc,  bs0, dAll0, 2'i32 + sub,    qb0a, 2, hmByte0, 1, eb0, tid + 32'i32)
+    q3kElemD(acc2, bs1, dAll1, 2'i32 + sub,    qb0b, 2, hmByte1, 1, eb1, tid + 32'i32)
+    q3kElemD(acc,  bs0, dAll0, 4'i32 + sub,    qb0a, 4, hmByte0, 2, eb0, tid + 64'i32)
+    q3kElemD(acc2, bs1, dAll1, 4'i32 + sub,    qb0b, 4, hmByte1, 2, eb1, tid + 64'i32)
+    q3kElemD(acc,  bs0, dAll0, 6'i32 + sub,    qb0a, 6, hmByte0, 3, eb0, tid + 96'i32)
+    q3kElemD(acc2, bs1, dAll1, 6'i32 + sub,    qb0b, 6, hmByte1, 3, eb1, tid + 96'i32)
+    q3kElemD(acc,  bs0, dAll0, 8'i32 + sub,    qb1a, 0, hmByte0, 4, eb0, tid + 128'i32)
+    q3kElemD(acc2, bs1, dAll1, 8'i32 + sub,    qb1b, 0, hmByte1, 4, eb1, tid + 128'i32)
+    q3kElemD(acc,  bs0, dAll0, 10'i32 + sub,   qb1a, 2, hmByte0, 5, eb0, tid + 160'i32)
+    q3kElemD(acc2, bs1, dAll1, 10'i32 + sub,   qb1b, 2, hmByte1, 5, eb1, tid + 160'i32)
+    q3kElemD(acc,  bs0, dAll0, 12'i32 + sub,   qb1a, 4, hmByte0, 6, eb0, tid + 192'i32)
+    q3kElemD(acc2, bs1, dAll1, 12'i32 + sub,   qb1b, 4, hmByte1, 6, eb1, tid + 192'i32)
+    q3kElemD(acc,  bs0, dAll0, 14'i32 + sub,   qb1a, 6, hmByte0, 7, eb0, tid + 224'i32)
+    q3kElemD(acc2, bs1, dAll1, 14'i32 + sub,   qb1b, 6, hmByte1, 7, eb1, tid + 224'i32)
+    blkIdx = blkIdx + 2'i32
+
   while blkIdx < nBlocksPerRow:
     let bs = rowBase + blkIdx * 110'i32
     let eb = blkIdx * 256'i32
@@ -563,6 +666,7 @@ proc linearQ3KDualWarpKernel(dst1: ptr cfloat, dst2: ptr cfloat, x: ptr cfloat,
     q3kElem(14'i32 + sub,   qb1, 6, 7, tid + 224'i32)
     blkIdx = blkIdx + 1'i32
 
+  acc = acc + acc2
   acc = acc + hippoShflDown(acc, 16)
   acc = acc + hippoShflDown(acc, 8)
   acc = acc + hippoShflDown(acc, 4)
