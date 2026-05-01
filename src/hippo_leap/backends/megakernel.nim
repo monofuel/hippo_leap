@@ -165,8 +165,10 @@ proc embeddingKernel(dst: ptr cfloat, weight: ptr cfloat,
 
 proc rmsnormKernel(dst: ptr cfloat, src: ptr cfloat, weight: ptr cfloat,
                    dim: cint, eps: cfloat) {.hippoGlobal.} =
-  var sdata {.hippoShared.}: array[BlockSize, cfloat]
+  var warpSums {.hippoShared.}: array[8, cfloat]
   let tid = cint(threadIdx.x)
+  let warpId = tid div 32'i32
+  let laneId = tid mod 32'i32
   let s = cast[ptr UncheckedArray[cfloat]](src)
   let d = cast[ptr UncheckedArray[cfloat]](dst)
   let wt = cast[ptr UncheckedArray[cfloat]](weight)
@@ -175,15 +177,21 @@ proc rmsnormKernel(dst: ptr cfloat, src: ptr cfloat, weight: ptr cfloat,
   while i < dim:
     sumSq = sumSq + s[i] * s[i]
     i = i + cint(blockDim.x)
-  sdata[tid] = sumSq
+  sumSq = sumSq + hippoShflDown(sumSq, 16)
+  sumSq = sumSq + hippoShflDown(sumSq, 8)
+  sumSq = sumSq + hippoShflDown(sumSq, 4)
+  sumSq = sumSq + hippoShflDown(sumSq, 2)
+  sumSq = sumSq + hippoShflDown(sumSq, 1)
+  if laneId == 0'i32: warpSums[warpId] = sumSq
   hippoSyncthreads()
-  var stride = cint(blockDim.x) div 2
-  while stride > 0:
-    if tid < stride:
-      sdata[tid] = sdata[tid] + sdata[tid + stride]
-    hippoSyncthreads()
-    stride = stride div 2
-  let rms = 1.0f / sqrtf(sdata[0] / cfloat(dim) + eps)
+  if warpId == 0'i32:
+    sumSq = if laneId < 8'i32: warpSums[laneId] else: 0.0f
+    sumSq = sumSq + hippoShflDown(sumSq, 4)
+    sumSq = sumSq + hippoShflDown(sumSq, 2)
+    sumSq = sumSq + hippoShflDown(sumSq, 1)
+    if laneId == 0'i32: warpSums[0] = sumSq
+  hippoSyncthreads()
+  let rms = 1.0f / sqrtf(warpSums[0] / cfloat(dim) + eps)
   i = tid
   while i < dim:
     d[i] = wt[i] * s[i] * rms
@@ -192,31 +200,36 @@ proc rmsnormKernel(dst: ptr cfloat, src: ptr cfloat, weight: ptr cfloat,
 proc residualRmsnormKernel(normOut: ptr cfloat, x: ptr cfloat,
                            residual: ptr cfloat, weight: ptr cfloat,
                            dim: cint, eps: cfloat) {.hippoGlobal.} =
-  var sdata {.hippoShared.}: array[BlockSize, cfloat]
+  var warpSums {.hippoShared.}: array[8, cfloat]
   let tid = cint(threadIdx.x)
+  let warpId = tid div 32'i32
+  let laneId = tid mod 32'i32
   let xArr = cast[ptr UncheckedArray[cfloat]](x)
   let rArr = cast[ptr UncheckedArray[cfloat]](residual)
   let nArr = cast[ptr UncheckedArray[cfloat]](normOut)
   let wt = cast[ptr UncheckedArray[cfloat]](weight)
+  var sumSq: cfloat = 0.0
   var i = tid
   while i < dim:
-    xArr[i] = xArr[i] + rArr[i]
+    let v = xArr[i] + rArr[i]
+    xArr[i] = v
+    sumSq = sumSq + v * v
     i = i + cint(blockDim.x)
+  sumSq = sumSq + hippoShflDown(sumSq, 16)
+  sumSq = sumSq + hippoShflDown(sumSq, 8)
+  sumSq = sumSq + hippoShflDown(sumSq, 4)
+  sumSq = sumSq + hippoShflDown(sumSq, 2)
+  sumSq = sumSq + hippoShflDown(sumSq, 1)
+  if laneId == 0'i32: warpSums[warpId] = sumSq
   hippoSyncthreads()
-  var sumSq: cfloat = 0.0
-  i = tid
-  while i < dim:
-    sumSq = sumSq + xArr[i] * xArr[i]
-    i = i + cint(blockDim.x)
-  sdata[tid] = sumSq
+  if warpId == 0'i32:
+    sumSq = if laneId < 8'i32: warpSums[laneId] else: 0.0f
+    sumSq = sumSq + hippoShflDown(sumSq, 4)
+    sumSq = sumSq + hippoShflDown(sumSq, 2)
+    sumSq = sumSq + hippoShflDown(sumSq, 1)
+    if laneId == 0'i32: warpSums[0] = sumSq
   hippoSyncthreads()
-  var stride = cint(blockDim.x) div 2
-  while stride > 0:
-    if tid < stride:
-      sdata[tid] = sdata[tid] + sdata[tid + stride]
-    hippoSyncthreads()
-    stride = stride div 2
-  let rms = 1.0f / sqrtf(sdata[0] / cfloat(dim) + eps)
+  let rms = 1.0f / sqrtf(warpSums[0] / cfloat(dim) + eps)
   i = tid
   while i < dim:
     nArr[i] = wt[i] * xArr[i] * rms
