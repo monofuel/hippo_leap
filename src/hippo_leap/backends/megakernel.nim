@@ -52,6 +52,7 @@ type
     scratch0: pointer       # [MaxDim] f32
     scratch1: pointer       # [MaxDim] f32
     scratch2: pointer       # [MaxDim] f32
+    actQ8: pointer          # Q8_1 quantized activation buffer [(MaxDim/32)*36 bytes]
     logits: pointer         # [nVocab] f32
     kvK: array[ModelCfg.nLayers, pointer]  # [KvDim, maxLen] f32
     kvV: array[ModelCfg.nLayers, pointer]
@@ -98,10 +99,59 @@ proc gridSync() {.importcpp: """
 const
   QK_K = 256
   BlockQ2KSize = 2 + 2 + (QK_K div 16) + (QK_K div 4)  # 84 bytes
+  QK8_1 = 32'i32
+  BlockQ8_1Size = 36 # 4 bytes (d,s fp16 pair) + 32 bytes (int8 qs)
 
 # ---------------------------------------------------------------------------
 # GPU Kernels — individual launches for correctness verification
 # ---------------------------------------------------------------------------
+
+proc quantizeQ8_1Kernel(dst: ptr uint8, src: ptr cfloat, nElems: cint) {.hippoGlobal.} =
+  ## Quantize float32 to Q8_1: 1 warp (32 threads) per Q8_1 block (32 elements).
+  ## Q8_1 block layout: [d:fp16, s:fp16, qs:int8[32]] = 36 bytes
+  let tid = cint(threadIdx.x)
+  let warpId = cint(blockIdx.x) * (cint(blockDim.x) div 32'i32) + (tid div 32'i32)
+  let laneId = tid and 31'i32
+  let elemIdx = warpId * 32'i32 + laneId
+  if elemIdx >= nElems: return
+
+  let srcArr = cast[ptr UncheckedArray[cfloat]](src)
+  let dstArr = cast[ptr UncheckedArray[uint8]](dst)
+  let val = srcArr[elemIdx]
+
+  # Warp reduce to find max absolute value
+  var amax = hippoFabsf(val)
+  amax = hippoFmaxf(amax, hippoShflDown(amax, 16))
+  amax = hippoFmaxf(amax, hippoShflDown(amax, 8))
+  amax = hippoFmaxf(amax, hippoShflDown(amax, 4))
+  amax = hippoFmaxf(amax, hippoShflDown(amax, 2))
+  amax = hippoFmaxf(amax, hippoShflDown(amax, 1))
+  amax = hippoShfl(amax, 0) # broadcast from lane 0
+
+  let d = amax / 127.0f
+  let id = if amax > 0.0f: 127.0f / amax else: 0.0f
+  let qi = cint(hippoRoundf(val * id))
+  let qByte = cast[int8](max(-128'i32, min(127'i32, qi)))
+
+  # Compute sum(qi * d) for zero-point correction
+  var sumQd = cfloat(qi) * d
+  sumQd = sumQd + hippoShflDown(sumQd, 16)
+  sumQd = sumQd + hippoShflDown(sumQd, 8)
+  sumQd = sumQd + hippoShflDown(sumQd, 4)
+  sumQd = sumQd + hippoShflDown(sumQd, 2)
+  sumQd = sumQd + hippoShflDown(sumQd, 1)
+
+  let blkBase = warpId * BlockQ8_1Size
+  # Lane 0 writes d and s (as fp16 pair)
+  if laneId == 0'i32:
+    let dH = hippoFloatToHalf(d)
+    let sH = hippoFloatToHalf(sumQd)
+    dstArr[blkBase + 0] = uint8(dH and 0xFF'u16)
+    dstArr[blkBase + 1] = uint8(dH shr 8)
+    dstArr[blkBase + 2] = uint8(sH and 0xFF'u16)
+    dstArr[blkBase + 3] = uint8(sH shr 8)
+  # All lanes write their int8 quant value
+  dstArr[blkBase + 4 + laneId] = cast[uint8](qByte)
 
 proc embeddingKernel(dst: ptr cfloat, weight: ptr cfloat,
                      tokenId: cint, nEmb: cint) {.hippoGlobal.} =
@@ -296,6 +346,87 @@ proc linearQ3KWarpKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
   acc = acc + hippoShflDown(acc, 1)
   if tid == 0'i32:
     outArr[row] = acc
+
+proc linearQ3KDp4aWarpKernel(dst: ptr cfloat, xQ8: ptr uint8, w: ptr uint8,
+                              inDim: cint, outDim: cint) {.hippoGlobal.} =
+  ## Q3K GEMV with dp4a: warp-per-row, uses pre-quantized Q8_1 activation.
+  ## QI3_K=16 threads per Q3K block, QR3_K=4 dp4a per thread, 4 elems per dp4a.
+  const QI3_K = 16'i32
+  const QR3_K = 4'i32
+  const QI8_1 = 8'i32
+
+  let tid = cint(threadIdx.x)
+  let row = cint(blockIdx.x)
+  if row >= outDim: return
+
+  let wArr = cast[ptr UncheckedArray[uint8]](w)
+  let q8Arr = cast[ptr UncheckedArray[uint8]](xQ8)
+  let outArr = cast[ptr UncheckedArray[cfloat]](dst)
+
+  let nBlocksPerRow = inDim div 256'i32
+  let rowSizeBytes = nBlocksPerRow * 110'i32
+  let rowBase = row * rowSizeBytes
+
+  let iqs = tid and (QI3_K - 1'i32)
+  let bq8Offset = QR3_K * (iqs div (QI3_K div 2'i32))
+  let scaleOffset = iqs - (iqs mod QI8_1) + (iqs mod QI8_1) div (QI8_1 div 2'i32)
+
+  var sumf: cfloat = 0.0
+
+  var blkIdx = tid div QI3_K
+  while blkIdx < nBlocksPerRow:
+    let bs = rowBase + blkIdx * 110'i32
+
+    let dRaw = uint16(wArr[bs + 108'i32]) or (uint16(wArr[bs + 109'i32]) shl 8)
+    let d3 = hippoHalfToFloat(dRaw)
+
+    let qsBase = bs + 32'i32 + iqs * 4'i32
+    let vl = cint(hippoLoadU32(addr wArr[qsBase]))
+
+    let hmBase = bs + (iqs mod (QI3_K div 2'i32)) * 4'i32
+    let vhRaw = cint(hippoLoadU32(addr wArr[hmBase]))
+    let vh = (not vhRaw) shr bq8Offset
+
+    let q8BlockBase = blkIdx * 8'i32 + bq8Offset
+
+    var blockSumf: cfloat = 0.0
+    for i in 0'i32 ..< QR3_K:
+      let isc = scaleOffset + 2'i32 * i
+
+      let iscLow = isc mod 8'i32
+      let scShiftLow = 4'i32 * (isc div 8'i32)
+      let scLow = (cint(wArr[bs + 96'i32 + iscLow]) shr scShiftLow) and 0x0F'i32
+
+      let iscHigh = isc mod 4'i32
+      let scShiftHigh = 2'i32 * (isc div 4'i32)
+      let scHigh = ((cint(wArr[bs + 96'i32 + 8'i32 + iscHigh]) shr scShiftHigh) and 3'i32) shl 4'i32
+
+      let sc = (scLow or scHigh) - 32'i32
+
+      let vil = (vl shr (2'i32 * i)) and 0x03030303'i32
+      let vih = ((vh shr i) shl 2'i32) and 0x04040404'i32
+      let vi = hippoVsubss4(vil, vih)
+
+      let q8Blk = q8BlockBase + i
+      let q8Base = q8Blk * BlockQ8_1Size
+      let q8dRaw = uint16(q8Arr[q8Base]) or (uint16(q8Arr[q8Base + 1]) shl 8)
+      let d8 = hippoHalfToFloat(q8dRaw)
+
+      let q8QsBase = q8Base + 4'i32 + (iqs mod QI8_1) * 4'i32
+      let u = cint(hippoLoadU32(addr q8Arr[q8QsBase]))
+
+      blockSumf = blockSumf + d8 * cfloat(hippoSdot4(vi, u, 0'i32)) * cfloat(sc)
+
+    sumf = sumf + d3 * blockSumf
+    blkIdx = blkIdx + 2'i32
+
+  sumf = sumf + hippoShflDown(sumf, 16)
+  sumf = sumf + hippoShflDown(sumf, 8)
+  sumf = sumf + hippoShflDown(sumf, 4)
+  sumf = sumf + hippoShflDown(sumf, 2)
+  sumf = sumf + hippoShflDown(sumf, 1)
+  if tid == 0'i32:
+    outArr[row] = sumf
 
 proc linearQ3KDualWarpKernel(dst1: ptr cfloat, dst2: ptr cfloat, x: ptr cfloat,
                              w1: ptr uint8, w2: ptr uint8,
@@ -1497,6 +1628,28 @@ proc gpuLinearQ3K(dst, x, w: pointer, inDim, outDim: int) =
     stream = mkStream,
     args = hippoArgs(dstP, xP, wP, iDim, oDim))
 
+proc gpuQuantizeQ8_1(dst, src: pointer, nElems: int) =
+  var dstP = cast[ptr uint8](dst)
+  var srcP = cast[ptr cfloat](src)
+  var n = cint(nElems)
+  let nWarps = (nElems + 31) div 32
+  let nBlocks = (nWarps + 7) div 8 # 8 warps per block of 256 threads
+  hippoLaunchKernel(quantizeQ8_1Kernel,
+    gridDim = newDim3(nBlocks.uint32), blockDim = block1d(),
+    stream = mkStream,
+    args = hippoArgs(dstP, srcP, n))
+
+proc gpuLinearQ3KDp4a(dst, xQ8, w: pointer, inDim, outDim: int) =
+  var dstP = cast[ptr cfloat](dst)
+  var xQ8P = cast[ptr uint8](xQ8)
+  var wP = cast[ptr uint8](w)
+  var iDim = cint(inDim)
+  var oDim = cint(outDim)
+  hippoLaunchKernel(linearQ3KDp4aWarpKernel,
+    gridDim = newDim3(outDim.uint32), blockDim = newDim3(mkc.WarpSize.uint32),
+    stream = mkStream,
+    args = hippoArgs(dstP, xQ8P, wP, iDim, oDim))
+
 proc gpuLinearQ3KDual(dst1, dst2, x: pointer, w1, w2: MkWeight, inDim, outDim: int) =
   var dst1P = cast[ptr cfloat](dst1)
   var dst2P = cast[ptr cfloat](dst2)
@@ -1735,18 +1888,22 @@ proc loadModelBackend*(m: var Model, hp: HParams) =
   mkWeights.ropeTheta = thetaAlloc.p
 
   # Activation buffers
+  const Q8_1BlockSize = 36 # 4 bytes (d,s as fp16 pair) + 32 bytes (qs)
+  const MaxQ8Blocks = (MaxDim + 31) div 32
   for alloc in [hippoMalloc(MaxDim * sizeof(float32)),
                 hippoMalloc(MaxDim * sizeof(float32)),
                 hippoMalloc(MaxDim * sizeof(float32)),
                 hippoMalloc(MaxDim * sizeof(float32)),
                 hippoMalloc(MaxDim * sizeof(float32)),
+                hippoMalloc(MaxQ8Blocks * Q8_1BlockSize),
                 hippoMalloc(ModelCfg.nVocab * sizeof(float32))]:
     mkBufAllocs.add(alloc)
-  mkBuf.act0 = mkBufAllocs[^6].p
-  mkBuf.act1 = mkBufAllocs[^5].p
-  mkBuf.scratch0 = mkBufAllocs[^4].p
-  mkBuf.scratch1 = mkBufAllocs[^3].p
-  mkBuf.scratch2 = mkBufAllocs[^2].p
+  mkBuf.act0 = mkBufAllocs[^7].p
+  mkBuf.act1 = mkBufAllocs[^6].p
+  mkBuf.scratch0 = mkBufAllocs[^5].p
+  mkBuf.scratch1 = mkBufAllocs[^4].p
+  mkBuf.scratch2 = mkBufAllocs[^3].p
+  mkBuf.actQ8 = mkBufAllocs[^2].p
   mkBuf.logits = mkBufAllocs[^1].p
 
   # KV cache
@@ -1860,23 +2017,56 @@ proc forwardDecodeIndividual(token: int32, curLen: int): seq[float32] =
         else:
           gpuAdd(mkBuf.act0, mkBuf.scratch1, ModelCfg.nEmb)
     else:
-      gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wq, ModelCfg.nEmb, QDim)
-      gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wk, ModelCfg.nEmb, KvDim)
-      gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
+      when defined(useDp4a):
+        gpuQuantizeQ8_1(mkBuf.actQ8, mkBuf.act1, ModelCfg.nEmb)
+        if lw.wq.qtype == GgmlTypeQ3K.int32:
+          gpuLinearQ3KDp4a(mkBuf.scratch0, mkBuf.actQ8, lw.wq.p, ModelCfg.nEmb, QDim)
+        else:
+          gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wq, ModelCfg.nEmb, QDim)
+        if lw.wk.qtype == GgmlTypeQ3K.int32:
+          gpuLinearQ3KDp4a(mkBuf.scratch1, mkBuf.actQ8, lw.wk.p, ModelCfg.nEmb, KvDim)
+        else:
+          gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wk, ModelCfg.nEmb, KvDim)
+        if lw.wv.qtype == GgmlTypeQ3K.int32:
+          gpuLinearQ3KDp4a(mkBuf.scratch2, mkBuf.actQ8, lw.wv.p, ModelCfg.nEmb, KvDim)
+        else:
+          gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
+      else:
+        gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wq, ModelCfg.nEmb, QDim)
+        gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wk, ModelCfg.nEmb, KvDim)
+        gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
       gpuRopeQKDecode(mkBuf.scratch0, mkBuf.scratch1, mkWeights.ropeTheta, curLen)
       gpuStoreKVPair(kvK, mkBuf.scratch1, kvV, mkBuf.scratch2, curLen, cacheCols)
       gpuAttentionDecode(mkBuf.scratch1, mkBuf.scratch0, kvK, kvV, curLen + 1, cacheCols)
       gpuLinear(mkBuf.scratch0, mkBuf.scratch1, lw.wo, QDim, ModelCfg.nEmb)
 
       gpuResidualRmsNorm(mkBuf.act1, mkBuf.act0, mkBuf.scratch0, lw.ffnNorm)
-      if lw.wGate.qtype == GgmlTypeQ3K.int32 and lw.wUp.qtype == GgmlTypeQ3K.int32:
-        gpuLinearQ3KDual(mkBuf.scratch0, mkBuf.scratch1, mkBuf.act1,
-                         lw.wGate, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
+      when defined(useDp4a):
+        gpuQuantizeQ8_1(mkBuf.actQ8, mkBuf.act1, ModelCfg.nEmb)
+        if lw.wGate.qtype == GgmlTypeQ3K.int32:
+          gpuLinearQ3KDp4a(mkBuf.scratch0, mkBuf.actQ8, lw.wGate.p, ModelCfg.nEmb, ModelCfg.ffnDim)
+        else:
+          gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
+        if lw.wUp.qtype == GgmlTypeQ3K.int32:
+          gpuLinearQ3KDp4a(mkBuf.scratch1, mkBuf.actQ8, lw.wUp.p, ModelCfg.nEmb, ModelCfg.ffnDim)
+        else:
+          gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
       else:
-        gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
-        gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
+        if lw.wGate.qtype == GgmlTypeQ3K.int32 and lw.wUp.qtype == GgmlTypeQ3K.int32:
+          gpuLinearQ3KDual(mkBuf.scratch0, mkBuf.scratch1, mkBuf.act1,
+                           lw.wGate, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
+        else:
+          gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
+          gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
       gpuSiluMul(mkBuf.scratch0, mkBuf.scratch1, ModelCfg.ffnDim)
-      gpuLinear(mkBuf.scratch1, mkBuf.scratch0, lw.wDown, ModelCfg.ffnDim, ModelCfg.nEmb)
+      when defined(useDp4a):
+        gpuQuantizeQ8_1(mkBuf.actQ8, mkBuf.scratch0, ModelCfg.ffnDim)
+        if lw.wDown.qtype == GgmlTypeQ3K.int32:
+          gpuLinearQ3KDp4a(mkBuf.scratch1, mkBuf.actQ8, lw.wDown.p, ModelCfg.ffnDim, ModelCfg.nEmb)
+        else:
+          gpuLinear(mkBuf.scratch1, mkBuf.scratch0, lw.wDown, ModelCfg.ffnDim, ModelCfg.nEmb)
+      else:
+        gpuLinear(mkBuf.scratch1, mkBuf.scratch0, lw.wDown, ModelCfg.ffnDim, ModelCfg.nEmb)
 
       if layer < ModelCfg.nLayers - 1:
         gpuResidualRmsNorm(mkBuf.act1, mkBuf.act0, mkBuf.scratch1,
