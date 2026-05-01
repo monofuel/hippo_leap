@@ -297,6 +297,76 @@ proc linearQ3KWarpKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
   if tid == 0'i32:
     outArr[row] = acc
 
+proc linearQ3KDualWarpKernel(dst1: ptr cfloat, dst2: ptr cfloat, x: ptr cfloat,
+                             w1: ptr uint8, w2: ptr uint8,
+                             inDim: cint, outDim: cint) {.hippoGlobal.} =
+  ## Dual Q3K warp GEMV: blocks 0..outDim-1 compute dst1 from w1,
+  ## blocks outDim..2*outDim-1 compute dst2 from w2. Same activation x.
+  let tid = cint(threadIdx.x)
+  let rawRow = cint(blockIdx.x)
+  let isSecond = rawRow >= outDim
+  let row = if isSecond: rawRow - outDim else: rawRow
+  if row >= outDim: return
+
+  let w = if isSecond: cast[ptr UncheckedArray[uint8]](w2)
+          else: cast[ptr UncheckedArray[uint8]](w1)
+  let outArr = if isSecond: cast[ptr UncheckedArray[cfloat]](dst2)
+               else: cast[ptr UncheckedArray[cfloat]](dst1)
+  let xArr = cast[ptr UncheckedArray[cfloat]](x)
+  let nBlocksPerRow = inDim div 256'i32
+  let rowSizeBytes = nBlocksPerRow * 110'i32
+  let rowBase = row * rowSizeBytes
+
+  let sub = (tid shr 4'i32) and 1'i32
+  let qsOff0 = 32'i32 + sub * 16'i32 + (tid and 15'i32)
+  let qsOff1 = 64'i32 + sub * 16'i32 + (tid and 15'i32)
+  let hmOff = sub * 16'i32 + (tid and 15'i32)
+
+  var acc: cfloat = 0.0
+  var blkIdx: cint = 0
+  while blkIdx < nBlocksPerRow:
+    let bs = rowBase + blkIdx * 110'i32
+    let eb = blkIdx * 256'i32
+    let dRaw = uint16(w[bs + 108'i32]) or (uint16(w[bs + 109'i32]) shl 8)
+    let dAll = hippoHalfToFloat(dRaw)
+    let qb0 = w[bs + qsOff0]
+    let qb1 = w[bs + qsOff1]
+    let hmByte = cint(w[bs + hmOff])
+
+    template q3kElem(scaleIdx: cint, qByte: untyped, qShift, hmBitPos, xOff: cint) {.dirty.} =
+      block:
+        let si = scaleIdx
+        let big = si and 3'i32
+        let ai = si shr 2'i32
+        let sByteVal = cint(w[bs + 96'i32 + (ai and 1'i32) * 4'i32 + big])
+        let tByteVal = cint(w[bs + 104'i32 + big])
+        let low = (sByteVal shr ((ai shr 1'i32) * 4'i32)) and 0x0F'i32
+        let high = ((tByteVal shr (ai * 2'i32)) and 0x03'i32) shl 4'i32
+        let scByte = low or high
+        let scSigned = (scByte xor 0x80'i32) - 0x80'i32
+        let dl = dAll * cfloat(scSigned - 32'i32)
+        let qval = cint((qByte shr qShift) and 3)
+        let hm = 4'i32 - ((hmByte shr hmBitPos) and 1'i32) * 4'i32
+        acc = acc + dl * cfloat(qval - hm) * xArr[eb + xOff]
+
+    q3kElem(sub,            qb0, 0, 0, tid)
+    q3kElem(2'i32 + sub,    qb0, 2, 1, tid + 32'i32)
+    q3kElem(4'i32 + sub,    qb0, 4, 2, tid + 64'i32)
+    q3kElem(6'i32 + sub,    qb0, 6, 3, tid + 96'i32)
+    q3kElem(8'i32 + sub,    qb1, 0, 4, tid + 128'i32)
+    q3kElem(10'i32 + sub,   qb1, 2, 5, tid + 160'i32)
+    q3kElem(12'i32 + sub,   qb1, 4, 6, tid + 192'i32)
+    q3kElem(14'i32 + sub,   qb1, 6, 7, tid + 224'i32)
+    blkIdx = blkIdx + 1'i32
+
+  acc = acc + hippoShflDown(acc, 16)
+  acc = acc + hippoShflDown(acc, 8)
+  acc = acc + hippoShflDown(acc, 4)
+  acc = acc + hippoShflDown(acc, 2)
+  acc = acc + hippoShflDown(acc, 1)
+  if tid == 0'i32:
+    outArr[row] = acc
+
 proc ropeQKDecodeKernel(q: ptr cfloat, k: ptr cfloat,
                         theta: ptr cfloat,
                         nHeadQ: cint, nHeadK: cint, headDim: cint,
@@ -1427,6 +1497,19 @@ proc gpuLinearQ3K(dst, x, w: pointer, inDim, outDim: int) =
     stream = mkStream,
     args = hippoArgs(dstP, xP, wP, iDim, oDim))
 
+proc gpuLinearQ3KDual(dst1, dst2, x: pointer, w1, w2: MkWeight, inDim, outDim: int) =
+  var dst1P = cast[ptr cfloat](dst1)
+  var dst2P = cast[ptr cfloat](dst2)
+  var xP = cast[ptr cfloat](x)
+  var w1P = cast[ptr uint8](w1.p)
+  var w2P = cast[ptr uint8](w2.p)
+  var iDim = cint(inDim)
+  var oDim = cint(outDim)
+  hippoLaunchKernel(linearQ3KDualWarpKernel,
+    gridDim = newDim3((outDim * 2).uint32), blockDim = newDim3(mkc.WarpSize.uint32),
+    stream = mkStream,
+    args = hippoArgs(dst1P, dst2P, xP, w1P, w2P, iDim, oDim))
+
 proc gpuLinearQ8_0(dst, x, w: pointer, inDim, outDim: int) =
   var dstP = cast[ptr cfloat](dst)
   var xP = cast[ptr cfloat](x)
@@ -1738,6 +1821,11 @@ proc forwardDecodeIndividual(token: int32, curLen: int): seq[float32] =
     echo "[mk] forward token=", token, " curLen=", curLen
   gpuEmbedding(mkBuf.act0, mkWeights.tokEmb, token)
 
+  when defined(profileMegakernel):
+    var tWq, tWk, tWv, tRope, tKV, tAttn, tWo, tNorm, tWgate, tWup, tSilu, tWdown, tResid, tOutput: float32
+    let profE0 = hippoEventCreate()
+    let profE1 = hippoEventCreate()
+
   for layer in 0 ..< ModelCfg.nLayers:
     let lw = mkWeights.layers[layer]
     let kvK = mkBuf.kvK[layer]
@@ -1746,31 +1834,78 @@ proc forwardDecodeIndividual(token: int32, curLen: int): seq[float32] =
     if layer == 0:
       gpuRmsNorm(mkBuf.act1, mkBuf.act0, lw.attnNorm)
 
-    gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wq, ModelCfg.nEmb, QDim)
-    gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wk, ModelCfg.nEmb, KvDim)
-    gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
-    gpuRopeQKDecode(mkBuf.scratch0, mkBuf.scratch1, mkWeights.ropeTheta, curLen)
-    gpuStoreKVPair(kvK, mkBuf.scratch1, kvV, mkBuf.scratch2, curLen, cacheCols)
-    gpuAttentionDecode(mkBuf.scratch1, mkBuf.scratch0, kvK, kvV, curLen + 1, cacheCols)
-    gpuLinear(mkBuf.scratch0, mkBuf.scratch1, lw.wo, QDim, ModelCfg.nEmb)
-
-    gpuResidualRmsNorm(mkBuf.act1, mkBuf.act0, mkBuf.scratch0, lw.ffnNorm)
-    gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
-    gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
-    gpuSiluMul(mkBuf.scratch0, mkBuf.scratch1, ModelCfg.ffnDim)
-    gpuLinear(mkBuf.scratch1, mkBuf.scratch0, lw.wDown, ModelCfg.ffnDim, ModelCfg.nEmb)
-
-    if layer < ModelCfg.nLayers - 1:
-      gpuResidualRmsNorm(mkBuf.act1, mkBuf.act0, mkBuf.scratch1,
-                         mkWeights.layers[layer + 1].attnNorm)
+    when defined(profileMegakernel):
+      template prof(accum: var float32, body: untyped) =
+        hippoEventRecord(profE0, mkStream)
+        body
+        hippoEventRecord(profE1, mkStream)
+        hippoEventSynchronize(profE1)
+        accum += hippoEventElapsedTime(profE0, profE1)
+      prof(tWq): gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wq, ModelCfg.nEmb, QDim)
+      prof(tWk): gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wk, ModelCfg.nEmb, KvDim)
+      prof(tWv): gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
+      prof(tRope): gpuRopeQKDecode(mkBuf.scratch0, mkBuf.scratch1, mkWeights.ropeTheta, curLen)
+      prof(tKV): gpuStoreKVPair(kvK, mkBuf.scratch1, kvV, mkBuf.scratch2, curLen, cacheCols)
+      prof(tAttn): gpuAttentionDecode(mkBuf.scratch1, mkBuf.scratch0, kvK, kvV, curLen + 1, cacheCols)
+      prof(tWo): gpuLinear(mkBuf.scratch0, mkBuf.scratch1, lw.wo, QDim, ModelCfg.nEmb)
+      prof(tNorm): gpuResidualRmsNorm(mkBuf.act1, mkBuf.act0, mkBuf.scratch0, lw.ffnNorm)
+      prof(tWgate): gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
+      prof(tWup): gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
+      prof(tSilu): gpuSiluMul(mkBuf.scratch0, mkBuf.scratch1, ModelCfg.ffnDim)
+      prof(tWdown): gpuLinear(mkBuf.scratch1, mkBuf.scratch0, lw.wDown, ModelCfg.ffnDim, ModelCfg.nEmb)
+      prof(tResid):
+        if layer < ModelCfg.nLayers - 1:
+          gpuResidualRmsNorm(mkBuf.act1, mkBuf.act0, mkBuf.scratch1,
+                             mkWeights.layers[layer + 1].attnNorm)
+        else:
+          gpuAdd(mkBuf.act0, mkBuf.scratch1, ModelCfg.nEmb)
     else:
-      gpuAdd(mkBuf.act0, mkBuf.scratch1, ModelCfg.nEmb)
+      gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wq, ModelCfg.nEmb, QDim)
+      gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wk, ModelCfg.nEmb, KvDim)
+      gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
+      gpuRopeQKDecode(mkBuf.scratch0, mkBuf.scratch1, mkWeights.ropeTheta, curLen)
+      gpuStoreKVPair(kvK, mkBuf.scratch1, kvV, mkBuf.scratch2, curLen, cacheCols)
+      gpuAttentionDecode(mkBuf.scratch1, mkBuf.scratch0, kvK, kvV, curLen + 1, cacheCols)
+      gpuLinear(mkBuf.scratch0, mkBuf.scratch1, lw.wo, QDim, ModelCfg.nEmb)
 
+      gpuResidualRmsNorm(mkBuf.act1, mkBuf.act0, mkBuf.scratch0, lw.ffnNorm)
+      if lw.wGate.qtype == GgmlTypeQ3K.int32 and lw.wUp.qtype == GgmlTypeQ3K.int32:
+        gpuLinearQ3KDual(mkBuf.scratch0, mkBuf.scratch1, mkBuf.act1,
+                         lw.wGate, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
+      else:
+        gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
+        gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
+      gpuSiluMul(mkBuf.scratch0, mkBuf.scratch1, ModelCfg.ffnDim)
+      gpuLinear(mkBuf.scratch1, mkBuf.scratch0, lw.wDown, ModelCfg.ffnDim, ModelCfg.nEmb)
+
+      if layer < ModelCfg.nLayers - 1:
+        gpuResidualRmsNorm(mkBuf.act1, mkBuf.act0, mkBuf.scratch1,
+                           mkWeights.layers[layer + 1].attnNorm)
+      else:
+        gpuAdd(mkBuf.act0, mkBuf.scratch1, ModelCfg.nEmb)
+
+  when defined(profileMegakernel):
+    var profStart = hippoEventCreate()
+    var profEnd = hippoEventCreate()
+    hippoEventRecord(profStart, mkStream)
   gpuRmsNorm(mkBuf.act1, mkBuf.act0, mkWeights.outputNorm)
   gpuLinear(mkBuf.logits, mkBuf.act1, mkWeights.outputWeight,
             ModelCfg.nEmb, ModelCfg.nVocab)
+  when defined(profileMegakernel):
+    hippoEventRecord(profEnd, mkStream)
+    hippoEventSynchronize(profEnd)
+    tOutput = hippoEventElapsedTime(profStart, profEnd)
+    hippoEventDestroy(profStart)
+    hippoEventDestroy(profEnd)
 
   hippoStreamSynchronize(mkStream)
+
+  when defined(profileMegakernel):
+    let total = tWq + tWk + tWv + tRope + tKV + tAttn + tWo + tNorm + tWgate + tWup + tSilu + tWdown + tResid + tOutput
+    echo &"[profile] wq={tWq:.2f} wk={tWk:.2f} wv={tWv:.2f} rope={tRope:.2f} kv={tKV:.2f} attn={tAttn:.2f} wo={tWo:.2f} norm={tNorm:.2f} wGate={tWgate:.2f} wUp={tWup:.2f} silu={tSilu:.2f} wDown={tWdown:.2f} resid={tResid:.2f} output={tOutput:.2f} total={total:.2f}ms"
+    hippoEventDestroy(profE0)
+    hippoEventDestroy(profE1)
+
   result = newSeq[float32](ModelCfg.nVocab)
   hippoMemcpy(addr result[0], mkBuf.logits, ModelCfg.nVocab * sizeof(float32),
               HippoMemcpyDeviceToHost)
@@ -1800,8 +1935,12 @@ proc forwardDecodeGraphBody() =
     gpuLinear(mkBuf.scratch0, mkBuf.scratch1, lw.wo, QDim, ModelCfg.nEmb)
 
     gpuResidualRmsNorm(mkBuf.act1, mkBuf.act0, mkBuf.scratch0, lw.ffnNorm)
-    gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
-    gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
+    if lw.wGate.qtype == GgmlTypeQ3K.int32 and lw.wUp.qtype == GgmlTypeQ3K.int32:
+      gpuLinearQ3KDual(mkBuf.scratch0, mkBuf.scratch1, mkBuf.act1,
+                       lw.wGate, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
+    else:
+      gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
+      gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
     gpuSiluMul(mkBuf.scratch0, mkBuf.scratch1, ModelCfg.ffnDim)
     gpuLinear(mkBuf.scratch1, mkBuf.scratch0, lw.wDown, ModelCfg.ffnDim, ModelCfg.nEmb)
 
