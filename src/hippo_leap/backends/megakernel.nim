@@ -452,6 +452,169 @@ proc linearQ8_0WarpKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
   if laneId == 0'i32:
     outArr[row] = acc
 
+proc linearQ2KLdsKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
+                        inDim: cint, outDim: cint) {.hippoGlobal.} =
+  var sAct {.hippoShared.}: array[2048, cfloat]
+  let tid = cint(threadIdx.x)
+  let warpId = tid div cint(mkc.WarpSize)
+  let laneId = tid mod cint(mkc.WarpSize)
+  let warpsPerBlock = cint(blockDim.x) div cint(mkc.WarpSize)
+  let xArr = cast[ptr UncheckedArray[cfloat]](x)
+  var i = tid
+  while i < inDim:
+    sAct[i] = xArr[i]
+    i = i + cint(blockDim.x)
+  hippoSyncthreads()
+  let row = cint(blockIdx.x) * warpsPerBlock + warpId
+  if row >= outDim: return
+  let wArr = cast[ptr UncheckedArray[uint8]](w)
+  let outArr = cast[ptr UncheckedArray[cfloat]](dst)
+  let nBlocksPerRow = inDim div cint(QK_K)
+  let rowSizeBytes = nBlocksPerRow * cint(BlockQ2KSize)
+  let rowBase = row * rowSizeBytes
+  let sub = (laneId shr 4'i32) and 1'i32
+  let qsOff0 = 16'i32 + sub * 16'i32 + (laneId and 15'i32)
+  let qsOff1 = 48'i32 + sub * 16'i32 + (laneId and 15'i32)
+  var acc: cfloat = 0.0
+  var blkIdx: cint = 0
+  while blkIdx < nBlocksPerRow:
+    let bs = rowBase + blkIdx * cint(BlockQ2KSize)
+    let eb = blkIdx * cint(QK_K)
+    let dRaw = uint16(wArr[bs + 80'i32]) or (uint16(wArr[bs + 81'i32]) shl 8)
+    let dmRaw = uint16(wArr[bs + 82'i32]) or (uint16(wArr[bs + 83'i32]) shl 8)
+    let d = hippoHalfToFloat(dRaw)
+    let dm = hippoHalfToFloat(dmRaw)
+    let qb0 = wArr[bs + qsOff0]
+    let qb1 = wArr[bs + qsOff1]
+    let sc0 = wArr[bs + sub]
+    acc = acc + (d * cfloat(sc0 and 0x0F'u8) * cfloat(qb0 and 3'u8) - dm * cfloat(sc0 shr 4)) * sAct[eb + laneId]
+    let sc1 = wArr[bs + 2'i32 + sub]
+    acc = acc + (d * cfloat(sc1 and 0x0F'u8) * cfloat((qb0 shr 2) and 3'u8) - dm * cfloat(sc1 shr 4)) * sAct[eb + laneId + 32'i32]
+    let sc2 = wArr[bs + 4'i32 + sub]
+    acc = acc + (d * cfloat(sc2 and 0x0F'u8) * cfloat((qb0 shr 4) and 3'u8) - dm * cfloat(sc2 shr 4)) * sAct[eb + laneId + 64'i32]
+    let sc3 = wArr[bs + 6'i32 + sub]
+    acc = acc + (d * cfloat(sc3 and 0x0F'u8) * cfloat((qb0 shr 6) and 3'u8) - dm * cfloat(sc3 shr 4)) * sAct[eb + laneId + 96'i32]
+    let sc4 = wArr[bs + 8'i32 + sub]
+    acc = acc + (d * cfloat(sc4 and 0x0F'u8) * cfloat(qb1 and 3'u8) - dm * cfloat(sc4 shr 4)) * sAct[eb + laneId + 128'i32]
+    let sc5 = wArr[bs + 10'i32 + sub]
+    acc = acc + (d * cfloat(sc5 and 0x0F'u8) * cfloat((qb1 shr 2) and 3'u8) - dm * cfloat(sc5 shr 4)) * sAct[eb + laneId + 160'i32]
+    let sc6 = wArr[bs + 12'i32 + sub]
+    acc = acc + (d * cfloat(sc6 and 0x0F'u8) * cfloat((qb1 shr 4) and 3'u8) - dm * cfloat(sc6 shr 4)) * sAct[eb + laneId + 192'i32]
+    let sc7 = wArr[bs + 14'i32 + sub]
+    acc = acc + (d * cfloat(sc7 and 0x0F'u8) * cfloat((qb1 shr 6) and 3'u8) - dm * cfloat(sc7 shr 4)) * sAct[eb + laneId + 224'i32]
+    blkIdx = blkIdx + 1'i32
+  acc = acc + hippoShflDown(acc, 16)
+  acc = acc + hippoShflDown(acc, 8)
+  acc = acc + hippoShflDown(acc, 4)
+  acc = acc + hippoShflDown(acc, 2)
+  acc = acc + hippoShflDown(acc, 1)
+  if laneId == 0'i32:
+    outArr[row] = acc
+
+proc linearQ3KLdsKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
+                        inDim: cint, outDim: cint) {.hippoGlobal.} =
+  var sAct {.hippoShared.}: array[2048, cfloat]
+  let tid = cint(threadIdx.x)
+  let warpId = tid div cint(mkc.WarpSize)
+  let laneId = tid mod cint(mkc.WarpSize)
+  let warpsPerBlock = cint(blockDim.x) div cint(mkc.WarpSize)
+  let xArr = cast[ptr UncheckedArray[cfloat]](x)
+  var i = tid
+  while i < inDim:
+    sAct[i] = xArr[i]
+    i = i + cint(blockDim.x)
+  hippoSyncthreads()
+  let row = cint(blockIdx.x) * warpsPerBlock + warpId
+  if row >= outDim: return
+  let wArr = cast[ptr UncheckedArray[uint8]](w)
+  let outArr = cast[ptr UncheckedArray[cfloat]](dst)
+  let nBlocksPerRow = inDim div 256'i32
+  let rowSizeBytes = nBlocksPerRow * 110'i32
+  let rowBase = row * rowSizeBytes
+  let sub = (laneId shr 4'i32) and 1'i32
+  let qsOff0 = 32'i32 + sub * 16'i32 + (laneId and 15'i32)
+  let qsOff1 = 64'i32 + sub * 16'i32 + (laneId and 15'i32)
+  let hmOff = sub * 16'i32 + (laneId and 15'i32)
+  var acc: cfloat = 0.0
+  var blkIdx: cint = 0
+  while blkIdx < nBlocksPerRow:
+    let bs = rowBase + blkIdx * 110'i32
+    let eb = blkIdx * 256'i32
+    let dRaw = uint16(wArr[bs + 108'i32]) or (uint16(wArr[bs + 109'i32]) shl 8)
+    let dAll = hippoHalfToFloat(dRaw)
+    let qb0 = wArr[bs + qsOff0]
+    let qb1 = wArr[bs + qsOff1]
+    let hmByte = cint(wArr[bs + hmOff])
+    template q3kElem(scaleIdx: cint, qByte: untyped, qShift, hmBitPos, xOff: cint) {.dirty.} =
+      block:
+        let si = scaleIdx
+        let big = si and 3'i32
+        let ai = si shr 2'i32
+        let sByteVal = cint(wArr[bs + 96'i32 + (ai and 1'i32) * 4'i32 + big])
+        let tByteVal = cint(wArr[bs + 104'i32 + big])
+        let low = (sByteVal shr ((ai shr 1'i32) * 4'i32)) and 0x0F'i32
+        let high = ((tByteVal shr (ai * 2'i32)) and 0x03'i32) shl 4'i32
+        let scByte = low or high
+        let scSigned = (scByte xor 0x80'i32) - 0x80'i32
+        let dl = dAll * cfloat(scSigned - 32'i32)
+        let qval = cint((qByte shr qShift) and 3)
+        let hm = 4'i32 - ((hmByte shr hmBitPos) and 1'i32) * 4'i32
+        acc = acc + dl * cfloat(qval - hm) * sAct[eb + xOff]
+    q3kElem(sub,            qb0, 0, 0, laneId)
+    q3kElem(2'i32 + sub,    qb0, 2, 1, laneId + 32'i32)
+    q3kElem(4'i32 + sub,    qb0, 4, 2, laneId + 64'i32)
+    q3kElem(6'i32 + sub,    qb0, 6, 3, laneId + 96'i32)
+    q3kElem(8'i32 + sub,    qb1, 0, 4, laneId + 128'i32)
+    q3kElem(10'i32 + sub,   qb1, 2, 5, laneId + 160'i32)
+    q3kElem(12'i32 + sub,   qb1, 4, 6, laneId + 192'i32)
+    q3kElem(14'i32 + sub,   qb1, 6, 7, laneId + 224'i32)
+    blkIdx = blkIdx + 1'i32
+  acc = acc + hippoShflDown(acc, 16)
+  acc = acc + hippoShflDown(acc, 8)
+  acc = acc + hippoShflDown(acc, 4)
+  acc = acc + hippoShflDown(acc, 2)
+  acc = acc + hippoShflDown(acc, 1)
+  if laneId == 0'i32:
+    outArr[row] = acc
+
+proc linearQ8_0LdsKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
+                          inDim: cint, outDim: cint) {.hippoGlobal.} =
+  var sAct {.hippoShared.}: array[2048, cfloat]
+  let tid = cint(threadIdx.x)
+  let warpId = tid div cint(mkc.WarpSize)
+  let laneId = tid mod cint(mkc.WarpSize)
+  let warpsPerBlock = cint(blockDim.x) div cint(mkc.WarpSize)
+  let xArr = cast[ptr UncheckedArray[cfloat]](x)
+  var i = tid
+  while i < inDim:
+    sAct[i] = xArr[i]
+    i = i + cint(blockDim.x)
+  hippoSyncthreads()
+  let row = cint(blockIdx.x) * warpsPerBlock + warpId
+  if row >= outDim: return
+  let wArr = cast[ptr UncheckedArray[uint8]](w)
+  let outArr = cast[ptr UncheckedArray[cfloat]](dst)
+  let nBlocksPerRow = inDim div 32'i32
+  let rowSizeBytes = nBlocksPerRow * cint(BlockQ8_0Size)
+  let rowBase = row * rowSizeBytes
+  var acc: cfloat = 0.0
+  var blkIdx: cint = 0
+  while blkIdx < nBlocksPerRow:
+    let bs = rowBase + blkIdx * cint(BlockQ8_0Size)
+    let eb = blkIdx * 32'i32
+    let dRaw = uint16(wArr[bs]) or (uint16(wArr[bs + 1'i32]) shl 8)
+    let d = hippoHalfToFloat(dRaw)
+    let qVal = cast[int8](wArr[bs + 2'i32 + laneId])
+    acc = acc + d * cfloat(qVal) * sAct[eb + laneId]
+    blkIdx = blkIdx + 1'i32
+  acc = acc + hippoShflDown(acc, 16)
+  acc = acc + hippoShflDown(acc, 8)
+  acc = acc + hippoShflDown(acc, 4)
+  acc = acc + hippoShflDown(acc, 2)
+  acc = acc + hippoShflDown(acc, 1)
+  if laneId == 0'i32:
+    outArr[row] = acc
+
 proc siluMulKernel(gate: ptr cfloat, up: ptr cfloat,
                    dim: cint) {.hippoGlobal.} =
   let tid = cint(blockIdx.x) * cint(blockDim.x) + cint(threadIdx.x)
@@ -1192,13 +1355,60 @@ proc gpuLinearQ8_0(dst, x, w: pointer, inDim, outDim: int) =
     stream = mkStream,
     args = hippoArgs(dstP, xP, wP, iDim, oDim))
 
+proc gpuLinearQ2KLds(dst, x, w: pointer, inDim, outDim: int) =
+  var dstP = cast[ptr cfloat](dst)
+  var xP = cast[ptr cfloat](x)
+  var wP = cast[ptr uint8](w)
+  var iDim = cint(inDim)
+  var oDim = cint(outDim)
+  let warpsPerBlock = BlockSize div mkc.WarpSize
+  let gridBlocks = (outDim + warpsPerBlock - 1) div warpsPerBlock
+  hippoLaunchKernel(linearQ2KLdsKernel,
+    gridDim = newDim3(gridBlocks.uint32), blockDim = block1d(),
+    stream = mkStream,
+    args = hippoArgs(dstP, xP, wP, iDim, oDim))
+
+proc gpuLinearQ3KLds(dst, x, w: pointer, inDim, outDim: int) =
+  var dstP = cast[ptr cfloat](dst)
+  var xP = cast[ptr cfloat](x)
+  var wP = cast[ptr uint8](w)
+  var iDim = cint(inDim)
+  var oDim = cint(outDim)
+  let warpsPerBlock = BlockSize div mkc.WarpSize
+  let gridBlocks = (outDim + warpsPerBlock - 1) div warpsPerBlock
+  hippoLaunchKernel(linearQ3KLdsKernel,
+    gridDim = newDim3(gridBlocks.uint32), blockDim = block1d(),
+    stream = mkStream,
+    args = hippoArgs(dstP, xP, wP, iDim, oDim))
+
+proc gpuLinearQ8_0Lds(dst, x, w: pointer, inDim, outDim: int) =
+  var dstP = cast[ptr cfloat](dst)
+  var xP = cast[ptr cfloat](x)
+  var wP = cast[ptr uint8](w)
+  var iDim = cint(inDim)
+  var oDim = cint(outDim)
+  let warpsPerBlock = BlockSize div mkc.WarpSize
+  let gridBlocks = (outDim + warpsPerBlock - 1) div warpsPerBlock
+  hippoLaunchKernel(linearQ8_0LdsKernel,
+    gridDim = newDim3(gridBlocks.uint32), blockDim = block1d(),
+    stream = mkStream,
+    args = hippoArgs(dstP, xP, wP, iDim, oDim))
+
 proc gpuLinear(dst, x: pointer, w: MkWeight, inDim, outDim: int) =
-  case w.qtype
-  of GgmlTypeF32.int32: gpuLinearF32(dst, x, w.p, inDim, outDim)
-  of GgmlTypeQ2K.int32: gpuLinearQ2K(dst, x, w.p, inDim, outDim)
-  of GgmlTypeQ3K.int32: gpuLinearQ3K(dst, x, w.p, inDim, outDim)
-  of GgmlTypeQ8_0.int32: gpuLinearQ8_0(dst, x, w.p, inDim, outDim)
-  else: raise newException(ValueError, "unsupported qtype for gpuLinear: " & $w.qtype)
+  if inDim <= ModelCfg.nEmb:
+    case w.qtype
+    of GgmlTypeQ2K.int32: gpuLinearQ2KLds(dst, x, w.p, inDim, outDim)
+    of GgmlTypeQ3K.int32: gpuLinearQ3KLds(dst, x, w.p, inDim, outDim)
+    of GgmlTypeQ8_0.int32: gpuLinearQ8_0Lds(dst, x, w.p, inDim, outDim)
+    of GgmlTypeF32.int32: gpuLinearF32(dst, x, w.p, inDim, outDim)
+    else: raise newException(ValueError, "unsupported qtype for gpuLinear: " & $w.qtype)
+  else:
+    case w.qtype
+    of GgmlTypeF32.int32: gpuLinearF32(dst, x, w.p, inDim, outDim)
+    of GgmlTypeQ2K.int32: gpuLinearQ2K(dst, x, w.p, inDim, outDim)
+    of GgmlTypeQ3K.int32: gpuLinearQ3K(dst, x, w.p, inDim, outDim)
+    of GgmlTypeQ8_0.int32: gpuLinearQ8_0(dst, x, w.p, inDim, outDim)
+    else: raise newException(ValueError, "unsupported qtype for gpuLinear: " & $w.qtype)
 
 # ---------------------------------------------------------------------------
 # Weight loading
