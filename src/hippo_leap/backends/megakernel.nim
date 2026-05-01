@@ -326,10 +326,10 @@ proc linearQ3KWarpKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
         let high = ((tByteVal shr (ai * 2'i32)) and 0x03'i32) shl 4'i32
         let scByte = low or high
         let scSigned = (scByte xor 0x80'i32) - 0x80'i32
-        let dl = dAll * cfloat(scSigned - 32'i32)
         let qval = cint((qByte shr qShift) and 3)
         let hm = 4'i32 - ((hmByte shr hmBitPos) and 1'i32) * 4'i32
-        acc = acc + dl * cfloat(qval - hm) * xArr[eb + xOff]
+        let intProd = (scSigned - 32'i32) * (qval - hm)
+        acc = acc + dAll * cfloat(intProd) * xArr[eb + xOff]
 
     q3kElem(sub,            qb0, 0, 0, tid)
     q3kElem(2'i32 + sub,    qb0, 2, 1, tid + 32'i32)
@@ -477,10 +477,10 @@ proc linearQ3KDualWarpKernel(dst1: ptr cfloat, dst2: ptr cfloat, x: ptr cfloat,
         let high = ((tByteVal shr (ai * 2'i32)) and 0x03'i32) shl 4'i32
         let scByte = low or high
         let scSigned = (scByte xor 0x80'i32) - 0x80'i32
-        let dl = dAll * cfloat(scSigned - 32'i32)
         let qval = cint((qByte shr qShift) and 3)
         let hm = 4'i32 - ((hmByte shr hmBitPos) and 1'i32) * 4'i32
-        acc = acc + dl * cfloat(qval - hm) * xArr[eb + xOff]
+        let intProd = (scSigned - 32'i32) * (qval - hm)
+        acc = acc + dAll * cfloat(intProd) * xArr[eb + xOff]
 
     q3kElem(sub,            qb0, 0, 0, tid)
     q3kElem(2'i32 + sub,    qb0, 2, 1, tid + 32'i32)
@@ -842,10 +842,10 @@ proc linearQ3KLdsKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
         let high = ((tByteVal shr (ai * 2'i32)) and 0x03'i32) shl 4'i32
         let scByte = low or high
         let scSigned = (scByte xor 0x80'i32) - 0x80'i32
-        let dl = dAll * cfloat(scSigned - 32'i32)
         let qval = cint((qByte shr qShift) and 3)
         let hm = 4'i32 - ((hmByte shr hmBitPos) and 1'i32) * 4'i32
-        acc = acc + dl * cfloat(qval - hm) * sAct[eb + xOff]
+        let intProd = (scSigned - 32'i32) * (qval - hm)
+        acc = acc + dAll * cfloat(intProd) * sAct[eb + xOff]
     q3kElem(sub,            qb0, 0, 0, laneId)
     q3kElem(2'i32 + sub,    qb0, 2, 1, laneId + 32'i32)
     q3kElem(4'i32 + sub,    qb0, 4, 2, laneId + 64'i32)
@@ -1155,10 +1155,10 @@ proc linearQ3KPhase(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
           let high = ((tByteVal shr (ai * 2'i32)) and 0x03'i32) shl 4'i32
           let scByte = low or high
           let scSigned = (scByte xor 0x80'i32) - 0x80'i32
-          let dl = dAll * cfloat(scSigned - 32'i32)
           let qval = cint((qByte shr qShift) and 3)
           let hm = 4'i32 - ((hmByte shr hmBitPos) and 1'i32) * 4'i32
-          acc = acc + dl * cfloat(qval - hm) * xArr[eb + xOff]
+          let intProd = (scSigned - 32'i32) * (qval - hm)
+          acc = acc + dAll * cfloat(intProd) * xArr[eb + xOff]
       q3kElem(sub,            qb0, 0, 0, laneId)
       q3kElem(2'i32 + sub,    qb0, 2, 1, laneId + 32'i32)
       q3kElem(4'i32 + sub,    qb0, 4, 2, laneId + 64'i32)
