@@ -1496,7 +1496,7 @@ proc gpuLinear(dst, x: pointer, w: MkWeight, inDim, outDim: int) =
   if inDim <= ModelCfg.nEmb:
     case w.qtype
     of GgmlTypeQ2K.int32: gpuLinearQ2K(dst, x, w.p, inDim, outDim)
-    of GgmlTypeQ3K.int32: gpuLinearQ3KLds(dst, x, w.p, inDim, outDim)
+    of GgmlTypeQ3K.int32: gpuLinearQ3K(dst, x, w.p, inDim, outDim)
     of GgmlTypeQ8_0.int32: gpuLinearQ8_0Lds(dst, x, w.p, inDim, outDim)
     of GgmlTypeF32.int32: gpuLinearF32(dst, x, w.p, inDim, outDim)
     else: raise newException(ValueError, "unsupported qtype for gpuLinear: " & $w.qtype)
