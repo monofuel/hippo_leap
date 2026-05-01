@@ -21,7 +21,7 @@ type
 
 const Azem* = MachineConfig(
   hostname: "azem",
-  gpu: GpuSpec(arch: "gfx1151", cuCount: 16, warpSize: 32,
+  gpu: GpuSpec(arch: "gfx1151", cuCount: 40, warpSize: 32,
                ldsBytes: 65536, vramBandwidthGBs: 256))
 
 const HighSteel* = MachineConfig(

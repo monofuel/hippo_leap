@@ -1,7 +1,7 @@
 ## Structured benchmark runner CLI command.
 
 import
-  std/[os, strutils, strformat],
+  std/[os, strutils, strformat, math],
   ./inference
 
 const
@@ -12,16 +12,16 @@ Options:
   --prompt, -p <text>   Prompt text (default: "Write a short story about a cat.")
   --tokens, -n <int>    Max tokens to generate (default: 128)
   --context <int>       Max context length (default: 2048)
-  --runs, -r <int>      Number of benchmark runs (default: 3)
-  --warmup <int>        Warmup runs before timing (default: 1)"""
+  --runs, -r <int>      Number of benchmark runs (default: 5)
+  --warmup <int>        Warmup runs before timing (default: 3)"""
 
 proc cmdBench*(args: seq[string]) =
   var modelPath = getEnv("HIPPO_LEAP_MODEL", "")
   var prompt = "Write a short story about a cat."
   var maxTokens = 128
   var maxContext = 2048
-  var runs = 3
-  var warmup = 1
+  var runs = 5
+  var warmup = 3
 
   var i = 0
   while i < args.len:
@@ -117,7 +117,11 @@ proc cmdBench*(args: seq[string]) =
       if v < minVal: minVal = v
       if v > maxVal: maxVal = v
     let mean = sum / float64(toksSec.len)
+    var variance = 0.0
+    for v in toksSec:
+      variance += (v - mean) * (v - mean)
+    let stddev = sqrt(variance / float64(toksSec.len))
     echo ""
-    echo &"Mean: {mean:.1f} tok/s"
+    echo &"Mean: {mean:.2f} ± {stddev:.2f} tok/s"
     echo &"Min:  {minVal:.1f} tok/s"
     echo &"Max:  {maxVal:.1f} tok/s"

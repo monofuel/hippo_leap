@@ -38,9 +38,46 @@ This project uses nimby for dependency management instead of nimble.
 
 ## Build
 
-- `make build` — compile the main `hippo_leap` binary
+- `make build` — compile megakernel backend (default, fast path)
+- `make build-megakernel` — same as above, explicit
+- `make build-naive` — compile naive backend (general purpose, slower)
 - `make tools` — compile CLI tools (health_check)
+- `make bench` — build megakernel + run TinyLlama Q2K benchmark
+- `make bench-gpu` — run GPU microbenchmark suite (bandwidth, cache, LDS, launch overhead)
 - Binary output lands in the project root (gitignored)
+
+### Build flags
+
+GPU builds require `--cc:hipcc` and several `-d:` flags. Use the Makefile targets to avoid mistakes.
+
+**Backend selection** (mutually exclusive, compile-time):
+- `-d:backendMegakernel` — hand-written HIP kernels, compile-time specialized per machine+model. This is the fast path (~163 tok/s on TinyLlama Q2K).
+- `-d:backendNaive` — general-purpose backend, no compile-time specialization
+
+**Megakernel dispatch modes** (megakernel backend only):
+- `-d:useIndividualLaunches` — one kernel launch per operation. **Required for full performance.** Without this flag, the default is the cooperative megakernel path which only uses `cuCount` blocks and is ~5x slower.
+- `-d:useGraphCapture` — HIP Graph capture mode (experimental, no speedup over individual launches)
+- No flag — cooperative persistent kernel (slow, limited to `cuCount` blocks)
+
+**Machine/model specialization** (megakernel backend only):
+- `-d:targetMachine=azem` — Strix Halo (gfx1151, 40 CU)
+- `-d:targetMachine=high-steel` — 7900 XTX (gfx1100, 96 CU)
+- `-d:targetModel=tinyllama_q2k` — TinyLlama 1.1B Q2_K
+
+**Other flags**:
+- `-d:HippoRuntime:HIP` — use HIP runtime (required for AMD GPUs)
+- `-d:useMalloc` — use malloc instead of Nim's GC allocator
+- `-d:zippyNoSimd` — disable x86 SIMD in zippy (prevents hipcc from trying to compile SSE for GPU)
+- `-d:profileMegakernel` — per-kernel timing output (individual launches only, adds sync overhead)
+- `-d:useDp4a` — experimental dp4a Q3K path (slower on gfx1151, not recommended)
+
+**Full megakernel build command** (equivalent to `make build`):
+```
+nim cpp --cc:hipcc -d:release -d:useMalloc -d:zippyNoSimd -d:HippoRuntime:HIP \
+  -d:backendMegakernel -d:useIndividualLaunches \
+  -d:targetMachine=azem -d:targetModel=tinyllama_q2k \
+  -o:hippo_leap src/hippo_leap.nim
+```
 
 ## Tests
 
@@ -54,6 +91,38 @@ This project uses nimby for dependency management instead of nimble.
 - GGUF models are stored on the NFS share at `/mnt/steel-chest/LLM/lmstudio/models/`
 - `TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf` — benchmark reference model from tinylama
 - `lmstudio-community/Llama-3.2-1B-Instruct-GGUF/` — small test models (Q4_K_M, Q8_0)
+
+## Remote access via npsh
+
+All builds, tests, and inference runs happen on `azem` (Strix Halo node). Use `npsh azem` as a prefix:
+
+```bash
+# Run a command on azem
+npsh azem nim r src/hippo_leap.nim -- bench ...
+
+# Check kernel logs / GPU health
+npsh azem sudo dmesg --level=err,warn | tail -50
+
+# Check GPU state
+npsh azem rocm-smi
+
+# Pin GPU clocks for benchmarking
+npsh azem bash -c 'echo "high" | sudo tee /sys/class/drm/card0/device/power_dpm_force_performance_level'
+```
+
+### GPU health checks
+
+Before trusting benchmark results, verify the GPU is healthy:
+
+1. **Check dmesg for page faults**: `npsh azem sudo dmesg --level=err,warn | grep -i "page fault\|amdgpu"`. If you see `PERMISSION_FAULTS` or `UTCL2` errors, the GPU is in a bad state and the node needs a reboot.
+2. **Check for lingering GPU processes**: `npsh azem fuser -v /dev/dri/renderD128 2>&1`
+3. **Verify clock state**: `npsh azem cat /sys/class/drm/card0/device/power_dpm_force_performance_level` (should be "high" for benchmarks)
+
+See `docs/gpu-fault-recovery.md` for details on GPU fault diagnosis and recovery.
+
+## External documentation
+
+- `/mnt/steel-chest/Monolab/Home/racha/docs/` — ROCm/HIP reference PDFs (AMD HIP Programming Guide, ROCm Programming Guide)
 
 ## Reference repos
 

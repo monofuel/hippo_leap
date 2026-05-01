@@ -1,16 +1,43 @@
-.PHONY: test integration-test e2e-test build tools
+.PHONY: test integration-test e2e-test build build-megakernel build-naive tools bench bench-gpu
 
 nim.cfg: nimby.lock
 	nimby sync -g nimby.lock
 
-# GPU build with naive backend (default)
-NIM_GPU_FLAGS ?= --cc:hipcc -d:useMalloc -d:backendNaive -d:zippyNoSimd
+# Shared flags for all GPU builds
+NIM_COMMON_FLAGS = --cc:hipcc -d:release -d:useMalloc -d:zippyNoSimd -d:HippoRuntime:HIP
 
-build: nim.cfg
-	nim cpp $(NIM_GPU_FLAGS) -o:hippo_leap src/hippo_leap.nim
+# --- Build targets ---
+
+# Megakernel backend (fast, compile-time specialized per machine+model)
+# This is the primary backend for benchmarking and inference.
+build-megakernel: nim.cfg
+	nim cpp $(NIM_COMMON_FLAGS) \
+		-d:backendMegakernel -d:useIndividualLaunches \
+		-d:targetMachine=azem -d:targetModel=tinyllama_q2k \
+		-o:hippo_leap src/hippo_leap.nim
+
+# Naive backend (general purpose, no compile-time specialization)
+build-naive: nim.cfg
+	nim cpp $(NIM_COMMON_FLAGS) \
+		-d:backendNaive \
+		-o:hippo_leap_naive src/hippo_leap.nim
+
+# Default build is megakernel
+build: build-megakernel
 
 tools: nim.cfg
 	nim c -o:health_check src/tools/health_check.nim
+
+# --- Benchmark targets ---
+
+bench: build-megakernel
+	./hippo_leap bench -m /mnt/steel-chest/LLM/lmstudio/models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf
+
+bench-gpu: nim.cfg
+	nim cpp $(NIM_COMMON_FLAGS) \
+		-d:backendMegakernel -d:useIndividualLaunches \
+		-d:targetMachine=azem -d:targetModel=tinyllama_q2k \
+		-r tests/bench_gpu.nim
 
 NIM_TEST_FLAGS ?= --hints:off --warnings:off
 
