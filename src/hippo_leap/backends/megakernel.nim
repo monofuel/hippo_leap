@@ -1120,6 +1120,55 @@ proc linearQ3KDualSiluWarpKernel(dst: ptr cfloat, x: ptr cfloat,
     let g = accG
     outArr[row] = (g / (1.0f + expf(-g))) * accU
 
+proc linearQ3KDualSiluSimpleWarpKernel(dst: ptr cfloat, x: ptr cfloat,
+                                        wGate: ptr uint8, wUp: ptr uint8,
+                                        inDim: cint, outDim: cint) {.hippoGlobal.} =
+  ## Fused dual Q3K GEMV + SiLU×mul without ILP unroll: 2 accumulators only.
+  let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
+  let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
+  let warpsPerBlock = cint(blockDim.x) div cint(mkc.WarpSize)
+  let row = cint(blockIdx.x) * warpsPerBlock + warpId
+  let tid = laneId
+  if row >= outDim: return
+
+  let gArr = cast[ptr UncheckedArray[uint8]](wGate)
+  let uArr = cast[ptr UncheckedArray[uint8]](wUp)
+  let xArr = cast[ptr UncheckedArray[cfloat]](x)
+  let outArr = cast[ptr UncheckedArray[cfloat]](dst)
+  let nBlocksPerRow = inDim div 256'i32
+  let rowSizeBytes = nBlocksPerRow * 110'i32
+  let rowBase = row * rowSizeBytes
+  let sub = (tid shr 4'i32) and 1'i32
+  let qsOff0 = 32'i32 + sub * 16'i32 + (tid and 15'i32)
+  let qsOff1 = 64'i32 + sub * 16'i32 + (tid and 15'i32)
+  let hmOff = sub * 16'i32 + (tid and 15'i32)
+
+  var accG: cfloat = 0.0
+  var accU: cfloat = 0.0
+  var blkIdx: cint = 0
+  while blkIdx < nBlocksPerRow:
+    let bs = rowBase + blkIdx * 110'i32
+    let eb = blkIdx * 256'i32
+    let xv0 = xArr[eb + tid]
+    let xv1 = xArr[eb + tid + 32'i32]
+    let xv2 = xArr[eb + tid + 64'i32]
+    let xv3 = xArr[eb + tid + 96'i32]
+    let xv4 = xArr[eb + tid + 128'i32]
+    let xv5 = xArr[eb + tid + 160'i32]
+    let xv6 = xArr[eb + tid + 192'i32]
+    let xv7 = xArr[eb + tid + 224'i32]
+    q3kAccumBlockVec(accG, gArr, bs, sub, qsOff0, qsOff1, hmOff,
+                      xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7)
+    q3kAccumBlockVec(accU, uArr, bs, sub, qsOff0, qsOff1, hmOff,
+                      xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7)
+    blkIdx = blkIdx + 1'i32
+
+  warpReduceSum(accG)
+  warpReduceSum(accU)
+  if tid == 0'i32:
+    let g = accG
+    outArr[row] = (g / (1.0f + expf(-g))) * accU
+
 proc ropeQKDecodeKernel(q: ptr cfloat, k: ptr cfloat,
                         theta: ptr cfloat,
                         nHeadQ: cint, nHeadK: cint, headDim: cint,
@@ -2293,7 +2342,7 @@ proc gpuLinearQ3KDualSilu(dst, x: pointer, wGate, wUp: MkWeight, inDim, outDim: 
   var iDim = cint(inDim)
   var oDim = cint(outDim)
   let nBlocks = (outDim.uint32 + WarpsPerLaunchBlock - 1) div WarpsPerLaunchBlock
-  hippoLaunchKernel(linearQ3KDualSiluWarpKernel,
+  hippoLaunchKernel(linearQ3KDualSiluSimpleWarpKernel,
     gridDim = newDim3(nBlocks), blockDim = newDim3(WarpsPerLaunchBlock * mkc.WarpSize.uint32),
     stream = mkStream,
     args = hippoArgs(dstP, xP, wGateP, wUpP, iDim, oDim))
@@ -2697,12 +2746,11 @@ proc forwardDecodeGpu(token: int32, curLen: int) =
           gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
       else:
         if lw.wGate.qtype == GgmlTypeQ3K.int32 and lw.wUp.qtype == GgmlTypeQ3K.int32:
-          gpuLinearQ3KDual(mkBuf.scratch0, mkBuf.scratch1, mkBuf.act1,
-                           lw.wGate, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
+          gpuLinearQ3KDualSilu(mkBuf.scratch0, mkBuf.act1, lw.wGate, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
         else:
           gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wGate, ModelCfg.nEmb, ModelCfg.ffnDim)
           gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wUp, ModelCfg.nEmb, ModelCfg.ffnDim)
-      gpuSiluMul(mkBuf.scratch0, mkBuf.scratch1, ModelCfg.ffnDim)
+          gpuSiluMul(mkBuf.scratch0, mkBuf.scratch1, ModelCfg.ffnDim)
       when defined(useDp4a):
         gpuQuantizeQ8_1(mkBuf.actQ8, mkBuf.scratch0, ModelCfg.ffnDim)
         if lw.wDown.qtype == GgmlTypeQ3K.int32:
