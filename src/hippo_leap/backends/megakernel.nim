@@ -757,46 +757,26 @@ proc linearQ3KDualWarpKernel(dst1: ptr cfloat, dst2: ptr cfloat, x: ptr cfloat,
 proc linearQ3KDualSiluSimpleWarpKernel(dst: ptr cfloat, x: ptr cfloat,
                                         wGate: ptr uint8, wUp: ptr uint8,
                                         inDim: cint, outDim: cint) {.hippoGlobal.} =
-  ## Fused dual Q3K GEMV + SiLU×mul without ILP unroll: 2 accumulators only.
   let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
   let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
   let warpsPerBlock = cint(blockDim.x) div cint(mkc.WarpSize)
   let row = cint(blockIdx.x) * warpsPerBlock + warpId
   let tid = laneId
   if row >= outDim: return
-
   let gArr = cast[ptr UncheckedArray[uint8]](wGate)
   let uArr = cast[ptr UncheckedArray[uint8]](wUp)
   let xArr = cast[ptr UncheckedArray[cfloat]](x)
   let outArr = cast[ptr UncheckedArray[cfloat]](dst)
   let nBlocksPerRow = inDim div 256'i32
-  let rowSizeBytes = nBlocksPerRow * 110'i32
-  let rowBase = row * rowSizeBytes
+  let rowBase = row * (nBlocksPerRow * 110'i32)
   let sub = (tid shr 4'i32) and 1'i32
   let qsOff0 = 32'i32 + sub * 16'i32 + (tid and 15'i32)
   let qsOff1 = 64'i32 + sub * 16'i32 + (tid and 15'i32)
   let hmOff = sub * 16'i32 + (tid and 15'i32)
-
   var accG: cfloat = 0.0
+  q3kILPAccumAll(accG, gArr, rowBase, nBlocksPerRow, sub, qsOff0, qsOff1, hmOff, tid, xArr)
   var accU: cfloat = 0.0
-  var blkIdx: cint = 0
-  while blkIdx < nBlocksPerRow:
-    let bs = rowBase + blkIdx * 110'i32
-    let eb = blkIdx * 256'i32
-    let xv0 = xArr[eb + tid]
-    let xv1 = xArr[eb + tid + 32'i32]
-    let xv2 = xArr[eb + tid + 64'i32]
-    let xv3 = xArr[eb + tid + 96'i32]
-    let xv4 = xArr[eb + tid + 128'i32]
-    let xv5 = xArr[eb + tid + 160'i32]
-    let xv6 = xArr[eb + tid + 192'i32]
-    let xv7 = xArr[eb + tid + 224'i32]
-    q3kAccumBlockVec(accG, gArr, bs, sub, qsOff0, qsOff1, hmOff,
-                      xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7)
-    q3kAccumBlockVec(accU, uArr, bs, sub, qsOff0, qsOff1, hmOff,
-                      xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7)
-    blkIdx = blkIdx + 1'i32
-
+  q3kILPAccumAll(accU, uArr, rowBase, nBlocksPerRow, sub, qsOff0, qsOff1, hmOff, tid, xArr)
   warpReduceSum(accG)
   warpReduceSum(accU)
   if tid == 0'i32:
