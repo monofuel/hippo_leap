@@ -126,6 +126,20 @@ template warpReduceMax(val: var cfloat) {.dirty.} =
   val = hippoFmaxf(val, hippoShflDown(val, 2))
   val = hippoFmaxf(val, hippoShflDown(val, 1))
 
+template blockReduceSum(val: var cfloat, warpSums: var array[8, cfloat]) {.dirty.} =
+  let warpId = cint(threadIdx.x) div 32'i32
+  let laneId = cint(threadIdx.x) mod 32'i32
+  warpReduceSum(val)
+  if laneId == 0'i32: warpSums[warpId] = val
+  hippoSyncthreads()
+  if warpId == 0'i32:
+    val = if laneId < 8'i32: warpSums[laneId] else: 0.0f
+    val = val + hippoShflDown(val, 4)
+    val = val + hippoShflDown(val, 2)
+    val = val + hippoShflDown(val, 1)
+    if laneId == 0'i32: warpSums[0] = val
+  hippoSyncthreads()
+
 # ---------------------------------------------------------------------------
 # Weight load abstraction — non-temporal loads bypass L2 for weight data
 # ---------------------------------------------------------------------------
@@ -243,6 +257,59 @@ template q3kAccumBlockVec(accVar: var cfloat, wArr: untyped, bs: cint,
     q3kElemVecX(accVar, r96, r100, r104, dAll, 12'i32 + sub,   qb1, 4, hmByte, 6, xv6)
     q3kElemVecX(accVar, r96, r100, r104, dAll, 14'i32 + sub,   qb1, 6, hmByte, 7, xv7)
 
+template q3kILPAccumAll(accVar: var cfloat, wArr: untyped, rowBase: cint,
+                        nBlocksPerRow: cint, sub, qsOff0, qsOff1, hmOff, tid: cint,
+                        xArr: untyped) {.dirty.} =
+  block:
+    var ilpAcc2: cfloat = 0.0
+    var blkIdx: cint = 0
+    while blkIdx + 1'i32 < nBlocksPerRow:
+      let bs0 = rowBase + blkIdx * 110'i32
+      let bs1 = rowBase + (blkIdx + 1'i32) * 110'i32
+      let eb0 = blkIdx * 256'i32
+      let eb1 = (blkIdx + 1'i32) * 256'i32
+      let dAll0 = wHalf(wArr, bs0 + 108'i32)
+      let dAll1 = wHalf(wArr, bs1 + 108'i32)
+      let qb0a = wByte(wArr, bs0 + qsOff0)
+      let qb1a = wByte(wArr, bs0 + qsOff1)
+      let hmByte0 = cint(wByte(wArr, bs0 + hmOff))
+      let qb0b = wByte(wArr, bs1 + qsOff0)
+      let qb1b = wByte(wArr, bs1 + qsOff1)
+      let hmByte1 = cint(wByte(wArr, bs1 + hmOff))
+      let r96_0 = wWord(wArr, bs0 + 96'i32)
+      let r100_0 = wWord(wArr, bs0 + 100'i32)
+      let r104_0 = wWord(wArr, bs0 + 104'i32)
+      let r96_1 = wWord(wArr, bs1 + 96'i32)
+      let r100_1 = wWord(wArr, bs1 + 100'i32)
+      let r104_1 = wWord(wArr, bs1 + 104'i32)
+      q3kElemVec(accVar,   r96_0, r100_0, r104_0, dAll0, sub,            qb0a, 0, hmByte0, 0, xArr, eb0 + tid)
+      q3kElemVec(ilpAcc2,  r96_1, r100_1, r104_1, dAll1, sub,            qb0b, 0, hmByte1, 0, xArr, eb1 + tid)
+      q3kElemVec(accVar,   r96_0, r100_0, r104_0, dAll0, 2'i32 + sub,    qb0a, 2, hmByte0, 1, xArr, eb0 + tid + 32'i32)
+      q3kElemVec(ilpAcc2,  r96_1, r100_1, r104_1, dAll1, 2'i32 + sub,    qb0b, 2, hmByte1, 1, xArr, eb1 + tid + 32'i32)
+      q3kElemVec(accVar,   r96_0, r100_0, r104_0, dAll0, 4'i32 + sub,    qb0a, 4, hmByte0, 2, xArr, eb0 + tid + 64'i32)
+      q3kElemVec(ilpAcc2,  r96_1, r100_1, r104_1, dAll1, 4'i32 + sub,    qb0b, 4, hmByte1, 2, xArr, eb1 + tid + 64'i32)
+      q3kElemVec(accVar,   r96_0, r100_0, r104_0, dAll0, 6'i32 + sub,    qb0a, 6, hmByte0, 3, xArr, eb0 + tid + 96'i32)
+      q3kElemVec(ilpAcc2,  r96_1, r100_1, r104_1, dAll1, 6'i32 + sub,    qb0b, 6, hmByte1, 3, xArr, eb1 + tid + 96'i32)
+      q3kElemVec(accVar,   r96_0, r100_0, r104_0, dAll0, 8'i32 + sub,    qb1a, 0, hmByte0, 4, xArr, eb0 + tid + 128'i32)
+      q3kElemVec(ilpAcc2,  r96_1, r100_1, r104_1, dAll1, 8'i32 + sub,    qb1b, 0, hmByte1, 4, xArr, eb1 + tid + 128'i32)
+      q3kElemVec(accVar,   r96_0, r100_0, r104_0, dAll0, 10'i32 + sub,   qb1a, 2, hmByte0, 5, xArr, eb0 + tid + 160'i32)
+      q3kElemVec(ilpAcc2,  r96_1, r100_1, r104_1, dAll1, 10'i32 + sub,   qb1b, 2, hmByte1, 5, xArr, eb1 + tid + 160'i32)
+      q3kElemVec(accVar,   r96_0, r100_0, r104_0, dAll0, 12'i32 + sub,   qb1a, 4, hmByte0, 6, xArr, eb0 + tid + 192'i32)
+      q3kElemVec(ilpAcc2,  r96_1, r100_1, r104_1, dAll1, 12'i32 + sub,   qb1b, 4, hmByte1, 6, xArr, eb1 + tid + 192'i32)
+      q3kElemVec(accVar,   r96_0, r100_0, r104_0, dAll0, 14'i32 + sub,   qb1a, 6, hmByte0, 7, xArr, eb0 + tid + 224'i32)
+      q3kElemVec(ilpAcc2,  r96_1, r100_1, r104_1, dAll1, 14'i32 + sub,   qb1b, 6, hmByte1, 7, xArr, eb1 + tid + 224'i32)
+      blkIdx = blkIdx + 2'i32
+    while blkIdx < nBlocksPerRow:
+      let bs = rowBase + blkIdx * 110'i32
+      let eb = blkIdx * 256'i32
+      q3kAccumBlockVec(accVar, wArr, bs, sub, qsOff0, qsOff1, hmOff,
+                        xArr[eb + tid], xArr[eb + tid + 32'i32],
+                        xArr[eb + tid + 64'i32], xArr[eb + tid + 96'i32],
+                        xArr[eb + tid + 128'i32], xArr[eb + tid + 160'i32],
+                        xArr[eb + tid + 192'i32], xArr[eb + tid + 224'i32])
+      blkIdx = blkIdx + 1'i32
+    accVar = accVar + ilpAcc2
+
 # ---------------------------------------------------------------------------
 # Q2K block accumulation templates
 # ---------------------------------------------------------------------------
@@ -354,8 +421,6 @@ proc rmsnormKernel(dst: ptr cfloat, src: ptr cfloat, weight: ptr cfloat,
                    dim: cint, eps: cfloat) {.hippoGlobal.} =
   var warpSums {.hippoShared.}: array[8, cfloat]
   let tid = cint(threadIdx.x)
-  let warpId = tid div 32'i32
-  let laneId = tid mod 32'i32
   let s = cast[ptr UncheckedArray[cfloat]](src)
   let d = cast[ptr UncheckedArray[cfloat]](dst)
   let wt = cast[ptr UncheckedArray[cfloat]](weight)
@@ -364,16 +429,7 @@ proc rmsnormKernel(dst: ptr cfloat, src: ptr cfloat, weight: ptr cfloat,
   while i < dim:
     sumSq = sumSq + s[i] * s[i]
     i = i + cint(blockDim.x)
-  warpReduceSum(sumSq)
-  if laneId == 0'i32: warpSums[warpId] = sumSq
-  hippoSyncthreads()
-  if warpId == 0'i32:
-    sumSq = if laneId < 8'i32: warpSums[laneId] else: 0.0f
-    sumSq = sumSq + hippoShflDown(sumSq, 4)
-    sumSq = sumSq + hippoShflDown(sumSq, 2)
-    sumSq = sumSq + hippoShflDown(sumSq, 1)
-    if laneId == 0'i32: warpSums[0] = sumSq
-  hippoSyncthreads()
+  blockReduceSum(sumSq, warpSums)
   let rms = 1.0f / sqrtf(warpSums[0] / cfloat(dim) + eps)
   i = tid
   while i < dim:
@@ -385,8 +441,6 @@ proc residualRmsnormKernel(normOut: ptr cfloat, x: ptr cfloat,
                            dim: cint, eps: cfloat) {.hippoGlobal.} =
   var warpSums {.hippoShared.}: array[8, cfloat]
   let tid = cint(threadIdx.x)
-  let warpId = tid div 32'i32
-  let laneId = tid mod 32'i32
   let xArr = cast[ptr UncheckedArray[cfloat]](x)
   let rArr = cast[ptr UncheckedArray[cfloat]](residual)
   let nArr = cast[ptr UncheckedArray[cfloat]](normOut)
@@ -398,16 +452,7 @@ proc residualRmsnormKernel(normOut: ptr cfloat, x: ptr cfloat,
     xArr[i] = v
     sumSq = sumSq + v * v
     i = i + cint(blockDim.x)
-  warpReduceSum(sumSq)
-  if laneId == 0'i32: warpSums[warpId] = sumSq
-  hippoSyncthreads()
-  if warpId == 0'i32:
-    sumSq = if laneId < 8'i32: warpSums[laneId] else: 0.0f
-    sumSq = sumSq + hippoShflDown(sumSq, 4)
-    sumSq = sumSq + hippoShflDown(sumSq, 2)
-    sumSq = sumSq + hippoShflDown(sumSq, 1)
-    if laneId == 0'i32: warpSums[0] = sumSq
-  hippoSyncthreads()
+  blockReduceSum(sumSq, warpSums)
   let rms = 1.0f / sqrtf(warpSums[0] / cfloat(dim) + eps)
   i = tid
   while i < dim:
@@ -580,223 +625,25 @@ proc linearQ2KQ3KTripleWarpKernel(dst1: ptr cfloat, dst2: ptr cfloat, dst3: ptr 
     if tid == 0'i32:
       outArr[row] = acc
 
-proc linearQ2K2RowWarpKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
-                             inDim: cint, outDim: cint) {.hippoGlobal.} =
-  ## 2-row Q2K GEMV: each warp handles 2 output rows, sharing activation loads.
-  let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
-  let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
-  let warpsPerBlock = cint(blockDim.x) div cint(mkc.WarpSize)
-  let row0 = (cint(blockIdx.x) * warpsPerBlock + warpId) * 2'i32
-  let row1 = row0 + 1'i32
-  if row0 >= outDim: return
-
-  let wArr = cast[ptr UncheckedArray[uint8]](w)
-  let xArr = cast[ptr UncheckedArray[cfloat]](x)
-  let outArr = cast[ptr UncheckedArray[cfloat]](dst)
-  let nBlocksPerRow = inDim div cint(QK_K)
-  let rowSizeBytes = nBlocksPerRow * cint(BlockQ2KSize)
-  let rowBase0 = row0 * rowSizeBytes
-  let rowBase1 = row1 * rowSizeBytes
-  let hasRow1 = row1 < outDim
-  let sub = (laneId shr 4'i32) and 1'i32
-  let qsOff0 = 16'i32 + sub * 16'i32 + (laneId and 15'i32)
-  let qsOff1 = 48'i32 + sub * 16'i32 + (laneId and 15'i32)
-
-  var acc0: cfloat = 0.0
-  var acc1: cfloat = 0.0
-  var blkIdx: cint = 0
-  while blkIdx < nBlocksPerRow:
-    let eb = blkIdx * cint(QK_K)
-    let xv0 = xArr[eb + laneId]
-    let xv1 = xArr[eb + laneId + 32'i32]
-    let xv2 = xArr[eb + laneId + 64'i32]
-    let xv3 = xArr[eb + laneId + 96'i32]
-    let xv4 = xArr[eb + laneId + 128'i32]
-    let xv5 = xArr[eb + laneId + 160'i32]
-    let xv6 = xArr[eb + laneId + 192'i32]
-    let xv7 = xArr[eb + laneId + 224'i32]
-    block:
-      let bs = rowBase0 + blkIdx * cint(BlockQ2KSize)
-      var d, dm {.noinit.}: cfloat
-      var qb0, qb1 {.noinit.}: uint8
-      q2kLoadBlock(wArr, bs, qsOff0, qsOff1, d, dm, qb0, qb1)
-      q2kAccumBlockX(acc0, wArr, bs, d, dm, qb0, qb1, sub,
-                      xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7)
-    if hasRow1:
-      let bs = rowBase1 + blkIdx * cint(BlockQ2KSize)
-      var d, dm {.noinit.}: cfloat
-      var qb0, qb1 {.noinit.}: uint8
-      q2kLoadBlock(wArr, bs, qsOff0, qsOff1, d, dm, qb0, qb1)
-      q2kAccumBlockX(acc1, wArr, bs, d, dm, qb0, qb1, sub,
-                      xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7)
-    blkIdx = blkIdx + 1'i32
-
-  warpReduceSum(acc0)
-  if laneId == 0'i32:
-    outArr[row0] = acc0
-  if hasRow1:
-    warpReduceSum(acc1)
-    if laneId == 0'i32:
-      outArr[row1] = acc1
-
-proc linearQ2KDual2RowWarpKernel(dst1: ptr cfloat, dst2: ptr cfloat, x: ptr cfloat,
-                                  w1: ptr uint8, w2: ptr uint8,
-                                  inDim: cint, outDim1: cint, outDim2: cint) {.hippoGlobal.} =
-  ## 2-row dual Q2K: maps rawRow pairs across w1 (outDim1 rows) and w2 (outDim2 rows).
-  let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
-  let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
-  let warpsPerBlock = cint(blockDim.x) div cint(mkc.WarpSize)
-  let rawRow = (cint(blockIdx.x) * warpsPerBlock + warpId) * 2'i32
-  let totalRows = outDim1 + outDim2
-  if rawRow >= totalRows: return
-
-  let isSecond0 = rawRow >= outDim1
-  let row0 = if isSecond0: rawRow - outDim1 else: rawRow
-  let w0 = if isSecond0: cast[ptr UncheckedArray[uint8]](w2)
-           else: cast[ptr UncheckedArray[uint8]](w1)
-  let out0 = if isSecond0: cast[ptr UncheckedArray[cfloat]](dst2)
-             else: cast[ptr UncheckedArray[cfloat]](dst1)
-
-  let rawRow1 = rawRow + 1'i32
-  let hasRow1 = rawRow1 < totalRows
-  let isSecond1 = rawRow1 >= outDim1
-  let row1 = if isSecond1: rawRow1 - outDim1 else: rawRow1
-  let w1Arr = if isSecond1: cast[ptr UncheckedArray[uint8]](w2)
-              else: cast[ptr UncheckedArray[uint8]](w1)
-  let out1 = if isSecond1: cast[ptr UncheckedArray[cfloat]](dst2)
-             else: cast[ptr UncheckedArray[cfloat]](dst1)
-
-  let xArr = cast[ptr UncheckedArray[cfloat]](x)
-  let nBlocksPerRow = inDim div cint(QK_K)
-  let rowSizeBytes = nBlocksPerRow * cint(BlockQ2KSize)
-  let rowBase0 = row0 * rowSizeBytes
-  let rowBase1 = row1 * rowSizeBytes
-  let sub = (laneId shr 4'i32) and 1'i32
-  let qsOff0 = 16'i32 + sub * 16'i32 + (laneId and 15'i32)
-  let qsOff1 = 48'i32 + sub * 16'i32 + (laneId and 15'i32)
-
-  var acc0: cfloat = 0.0
-  var acc1: cfloat = 0.0
-  var blkIdx: cint = 0
-  while blkIdx < nBlocksPerRow:
-    let eb = blkIdx * cint(QK_K)
-    let xv0 = xArr[eb + laneId]
-    let xv1 = xArr[eb + laneId + 32'i32]
-    let xv2 = xArr[eb + laneId + 64'i32]
-    let xv3 = xArr[eb + laneId + 96'i32]
-    let xv4 = xArr[eb + laneId + 128'i32]
-    let xv5 = xArr[eb + laneId + 160'i32]
-    let xv6 = xArr[eb + laneId + 192'i32]
-    let xv7 = xArr[eb + laneId + 224'i32]
-    block:
-      let bs = rowBase0 + blkIdx * cint(BlockQ2KSize)
-      var d, dm {.noinit.}: cfloat
-      var qb0, qb1 {.noinit.}: uint8
-      q2kLoadBlock(w0, bs, qsOff0, qsOff1, d, dm, qb0, qb1)
-      q2kAccumBlockX(acc0, w0, bs, d, dm, qb0, qb1, sub,
-                      xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7)
-    if hasRow1:
-      let bs = rowBase1 + blkIdx * cint(BlockQ2KSize)
-      var d, dm {.noinit.}: cfloat
-      var qb0, qb1 {.noinit.}: uint8
-      q2kLoadBlock(w1Arr, bs, qsOff0, qsOff1, d, dm, qb0, qb1)
-      q2kAccumBlockX(acc1, w1Arr, bs, d, dm, qb0, qb1, sub,
-                      xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7)
-    blkIdx = blkIdx + 1'i32
-
-  warpReduceSum(acc0)
-  if laneId == 0'i32:
-    out0[row0] = acc0
-  if hasRow1:
-    warpReduceSum(acc1)
-    if laneId == 0'i32:
-      out1[row1] = acc1
-
 proc linearQ3KWarpKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
                          inDim: cint, outDim: cint) {.hippoGlobal.} =
-  ## Warp-per-row Q3_K GEMV.
   let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
   let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
   let warpsPerBlock = cint(blockDim.x) div cint(mkc.WarpSize)
   let row = cint(blockIdx.x) * warpsPerBlock + warpId
   let tid = laneId
   if row >= outDim: return
-
   let wArr = cast[ptr UncheckedArray[uint8]](w)
   let xArr = cast[ptr UncheckedArray[cfloat]](x)
   let outArr = cast[ptr UncheckedArray[cfloat]](dst)
   let nBlocksPerRow = inDim div 256'i32
-  let rowSizeBytes = nBlocksPerRow * 110'i32
-  let rowBase = row * rowSizeBytes
-
+  let rowBase = row * (nBlocksPerRow * 110'i32)
   let sub = (tid shr 4'i32) and 1'i32
   let qsOff0 = 32'i32 + sub * 16'i32 + (tid and 15'i32)
   let qsOff1 = 64'i32 + sub * 16'i32 + (tid and 15'i32)
   let hmOff = sub * 16'i32 + (tid and 15'i32)
-
   var acc: cfloat = 0.0
-  var acc2: cfloat = 0.0
-  var blkIdx: cint = 0
-  while blkIdx + 1'i32 < nBlocksPerRow:
-    let bs0 = rowBase + blkIdx * 110'i32
-    let bs1 = rowBase + (blkIdx + 1'i32) * 110'i32
-    let eb0 = blkIdx * 256'i32
-    let eb1 = (blkIdx + 1'i32) * 256'i32
-    let dAll0 = wHalf(wArr, bs0 + 108'i32)
-    let dAll1 = wHalf(wArr, bs1 + 108'i32)
-    let qb0a = wByte(wArr, bs0 + qsOff0)
-    let qb1a = wByte(wArr, bs0 + qsOff1)
-    let hmByte0 = cint(wByte(wArr, bs0 + hmOff))
-    let qb0b = wByte(wArr, bs1 + qsOff0)
-    let qb1b = wByte(wArr, bs1 + qsOff1)
-    let hmByte1 = cint(wByte(wArr, bs1 + hmOff))
-    let r96_0 = wWord(wArr, bs0 + 96'i32)
-    let r100_0 = wWord(wArr, bs0 + 100'i32)
-    let r104_0 = wWord(wArr, bs0 + 104'i32)
-    let r96_1 = wWord(wArr, bs1 + 96'i32)
-    let r100_1 = wWord(wArr, bs1 + 100'i32)
-    let r104_1 = wWord(wArr, bs1 + 104'i32)
-
-    q3kElemVec(acc,  r96_0, r100_0, r104_0, dAll0, sub,            qb0a, 0, hmByte0, 0, xArr, eb0 + tid)
-    q3kElemVec(acc2, r96_1, r100_1, r104_1, dAll1, sub,            qb0b, 0, hmByte1, 0, xArr, eb1 + tid)
-    q3kElemVec(acc,  r96_0, r100_0, r104_0, dAll0, 2'i32 + sub,    qb0a, 2, hmByte0, 1, xArr, eb0 + tid + 32'i32)
-    q3kElemVec(acc2, r96_1, r100_1, r104_1, dAll1, 2'i32 + sub,    qb0b, 2, hmByte1, 1, xArr, eb1 + tid + 32'i32)
-    q3kElemVec(acc,  r96_0, r100_0, r104_0, dAll0, 4'i32 + sub,    qb0a, 4, hmByte0, 2, xArr, eb0 + tid + 64'i32)
-    q3kElemVec(acc2, r96_1, r100_1, r104_1, dAll1, 4'i32 + sub,    qb0b, 4, hmByte1, 2, xArr, eb1 + tid + 64'i32)
-    q3kElemVec(acc,  r96_0, r100_0, r104_0, dAll0, 6'i32 + sub,    qb0a, 6, hmByte0, 3, xArr, eb0 + tid + 96'i32)
-    q3kElemVec(acc2, r96_1, r100_1, r104_1, dAll1, 6'i32 + sub,    qb0b, 6, hmByte1, 3, xArr, eb1 + tid + 96'i32)
-    q3kElemVec(acc,  r96_0, r100_0, r104_0, dAll0, 8'i32 + sub,    qb1a, 0, hmByte0, 4, xArr, eb0 + tid + 128'i32)
-    q3kElemVec(acc2, r96_1, r100_1, r104_1, dAll1, 8'i32 + sub,    qb1b, 0, hmByte1, 4, xArr, eb1 + tid + 128'i32)
-    q3kElemVec(acc,  r96_0, r100_0, r104_0, dAll0, 10'i32 + sub,   qb1a, 2, hmByte0, 5, xArr, eb0 + tid + 160'i32)
-    q3kElemVec(acc2, r96_1, r100_1, r104_1, dAll1, 10'i32 + sub,   qb1b, 2, hmByte1, 5, xArr, eb1 + tid + 160'i32)
-    q3kElemVec(acc,  r96_0, r100_0, r104_0, dAll0, 12'i32 + sub,   qb1a, 4, hmByte0, 6, xArr, eb0 + tid + 192'i32)
-    q3kElemVec(acc2, r96_1, r100_1, r104_1, dAll1, 12'i32 + sub,   qb1b, 4, hmByte1, 6, xArr, eb1 + tid + 192'i32)
-    q3kElemVec(acc,  r96_0, r100_0, r104_0, dAll0, 14'i32 + sub,   qb1a, 6, hmByte0, 7, xArr, eb0 + tid + 224'i32)
-    q3kElemVec(acc2, r96_1, r100_1, r104_1, dAll1, 14'i32 + sub,   qb1b, 6, hmByte1, 7, xArr, eb1 + tid + 224'i32)
-    blkIdx = blkIdx + 2'i32
-
-  while blkIdx < nBlocksPerRow:
-    let bs = rowBase + blkIdx * 110'i32
-    let eb = blkIdx * 256'i32
-    let dAll = wHalf(wArr, bs + 108'i32)
-    let qb0 = wByte(wArr, bs + qsOff0)
-    let qb1 = wByte(wArr, bs + qsOff1)
-    let hmByte = cint(wByte(wArr, bs + hmOff))
-    let r96 = wWord(wArr, bs + 96'i32)
-    let r100 = wWord(wArr, bs + 100'i32)
-    let r104 = wWord(wArr, bs + 104'i32)
-
-    q3kElemVec(acc, r96, r100, r104, dAll, sub,            qb0, 0, hmByte, 0, xArr, eb + tid)
-    q3kElemVec(acc, r96, r100, r104, dAll, 2'i32 + sub,    qb0, 2, hmByte, 1, xArr, eb + tid + 32'i32)
-    q3kElemVec(acc, r96, r100, r104, dAll, 4'i32 + sub,    qb0, 4, hmByte, 2, xArr, eb + tid + 64'i32)
-    q3kElemVec(acc, r96, r100, r104, dAll, 6'i32 + sub,    qb0, 6, hmByte, 3, xArr, eb + tid + 96'i32)
-    q3kElemVec(acc, r96, r100, r104, dAll, 8'i32 + sub,    qb1, 0, hmByte, 4, xArr, eb + tid + 128'i32)
-    q3kElemVec(acc, r96, r100, r104, dAll, 10'i32 + sub,   qb1, 2, hmByte, 5, xArr, eb + tid + 160'i32)
-    q3kElemVec(acc, r96, r100, r104, dAll, 12'i32 + sub,   qb1, 4, hmByte, 6, xArr, eb + tid + 192'i32)
-    q3kElemVec(acc, r96, r100, r104, dAll, 14'i32 + sub,   qb1, 6, hmByte, 7, xArr, eb + tid + 224'i32)
-    blkIdx = blkIdx + 1'i32
-
-  acc = acc + acc2
+  q3kILPAccumAll(acc, wArr, rowBase, nBlocksPerRow, sub, qsOff0, qsOff1, hmOff, tid, xArr)
   warpReduceSum(acc)
   if tid == 0'i32:
     outArr[row] = acc
@@ -882,8 +729,6 @@ proc linearQ3KDp4aWarpKernel(dst: ptr cfloat, xQ8: ptr uint8, w: ptr uint8,
 proc linearQ3KDualWarpKernel(dst1: ptr cfloat, dst2: ptr cfloat, x: ptr cfloat,
                              w1: ptr uint8, w2: ptr uint8,
                              inDim: cint, outDim: cint) {.hippoGlobal.} =
-  ## Dual Q3K warp GEMV: blocks 0..outDim-1 compute dst1 from w1,
-  ## Dual Q3K: rows 0..outDim-1 from w1, outDim..2*outDim-1 from w2.
   let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
   let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
   let warpsPerBlock = cint(blockDim.x) div cint(mkc.WarpSize)
@@ -892,349 +737,22 @@ proc linearQ3KDualWarpKernel(dst1: ptr cfloat, dst2: ptr cfloat, x: ptr cfloat,
   let isSecond = rawRow >= outDim
   let row = if isSecond: rawRow - outDim else: rawRow
   if row >= outDim: return
-
   let w = if isSecond: cast[ptr UncheckedArray[uint8]](w2)
           else: cast[ptr UncheckedArray[uint8]](w1)
   let outArr = if isSecond: cast[ptr UncheckedArray[cfloat]](dst2)
                else: cast[ptr UncheckedArray[cfloat]](dst1)
   let xArr = cast[ptr UncheckedArray[cfloat]](x)
   let nBlocksPerRow = inDim div 256'i32
-  let rowSizeBytes = nBlocksPerRow * 110'i32
-  let rowBase = row * rowSizeBytes
-
+  let rowBase = row * (nBlocksPerRow * 110'i32)
   let sub = (tid shr 4'i32) and 1'i32
   let qsOff0 = 32'i32 + sub * 16'i32 + (tid and 15'i32)
   let qsOff1 = 64'i32 + sub * 16'i32 + (tid and 15'i32)
   let hmOff = sub * 16'i32 + (tid and 15'i32)
-
   var acc: cfloat = 0.0
-  var acc2: cfloat = 0.0
-  var blkIdx: cint = 0
-  while blkIdx + 1'i32 < nBlocksPerRow:
-    let bs0 = rowBase + blkIdx * 110'i32
-    let bs1 = rowBase + (blkIdx + 1'i32) * 110'i32
-    let eb0 = blkIdx * 256'i32
-    let eb1 = (blkIdx + 1'i32) * 256'i32
-    let dAll0 = wHalf(w, bs0 + 108'i32)
-    let dAll1 = wHalf(w, bs1 + 108'i32)
-    let qb0a = wByte(w, bs0 + qsOff0)
-    let qb1a = wByte(w, bs0 + qsOff1)
-    let hmByte0 = cint(wByte(w, bs0 + hmOff))
-    let qb0b = wByte(w, bs1 + qsOff0)
-    let qb1b = wByte(w, bs1 + qsOff1)
-    let hmByte1 = cint(wByte(w, bs1 + hmOff))
-    let r96_0 = wWord(w, bs0 + 96'i32)
-    let r100_0 = wWord(w, bs0 + 100'i32)
-    let r104_0 = wWord(w, bs0 + 104'i32)
-    let r96_1 = wWord(w, bs1 + 96'i32)
-    let r100_1 = wWord(w, bs1 + 100'i32)
-    let r104_1 = wWord(w, bs1 + 104'i32)
-
-    q3kElemVec(acc,  r96_0, r100_0, r104_0, dAll0, sub,            qb0a, 0, hmByte0, 0, xArr, eb0 + tid)
-    q3kElemVec(acc2, r96_1, r100_1, r104_1, dAll1, sub,            qb0b, 0, hmByte1, 0, xArr, eb1 + tid)
-    q3kElemVec(acc,  r96_0, r100_0, r104_0, dAll0, 2'i32 + sub,    qb0a, 2, hmByte0, 1, xArr, eb0 + tid + 32'i32)
-    q3kElemVec(acc2, r96_1, r100_1, r104_1, dAll1, 2'i32 + sub,    qb0b, 2, hmByte1, 1, xArr, eb1 + tid + 32'i32)
-    q3kElemVec(acc,  r96_0, r100_0, r104_0, dAll0, 4'i32 + sub,    qb0a, 4, hmByte0, 2, xArr, eb0 + tid + 64'i32)
-    q3kElemVec(acc2, r96_1, r100_1, r104_1, dAll1, 4'i32 + sub,    qb0b, 4, hmByte1, 2, xArr, eb1 + tid + 64'i32)
-    q3kElemVec(acc,  r96_0, r100_0, r104_0, dAll0, 6'i32 + sub,    qb0a, 6, hmByte0, 3, xArr, eb0 + tid + 96'i32)
-    q3kElemVec(acc2, r96_1, r100_1, r104_1, dAll1, 6'i32 + sub,    qb0b, 6, hmByte1, 3, xArr, eb1 + tid + 96'i32)
-    q3kElemVec(acc,  r96_0, r100_0, r104_0, dAll0, 8'i32 + sub,    qb1a, 0, hmByte0, 4, xArr, eb0 + tid + 128'i32)
-    q3kElemVec(acc2, r96_1, r100_1, r104_1, dAll1, 8'i32 + sub,    qb1b, 0, hmByte1, 4, xArr, eb1 + tid + 128'i32)
-    q3kElemVec(acc,  r96_0, r100_0, r104_0, dAll0, 10'i32 + sub,   qb1a, 2, hmByte0, 5, xArr, eb0 + tid + 160'i32)
-    q3kElemVec(acc2, r96_1, r100_1, r104_1, dAll1, 10'i32 + sub,   qb1b, 2, hmByte1, 5, xArr, eb1 + tid + 160'i32)
-    q3kElemVec(acc,  r96_0, r100_0, r104_0, dAll0, 12'i32 + sub,   qb1a, 4, hmByte0, 6, xArr, eb0 + tid + 192'i32)
-    q3kElemVec(acc2, r96_1, r100_1, r104_1, dAll1, 12'i32 + sub,   qb1b, 4, hmByte1, 6, xArr, eb1 + tid + 192'i32)
-    q3kElemVec(acc,  r96_0, r100_0, r104_0, dAll0, 14'i32 + sub,   qb1a, 6, hmByte0, 7, xArr, eb0 + tid + 224'i32)
-    q3kElemVec(acc2, r96_1, r100_1, r104_1, dAll1, 14'i32 + sub,   qb1b, 6, hmByte1, 7, xArr, eb1 + tid + 224'i32)
-    blkIdx = blkIdx + 2'i32
-
-  while blkIdx < nBlocksPerRow:
-    let bs = rowBase + blkIdx * 110'i32
-    let eb = blkIdx * 256'i32
-    let dAll = wHalf(w, bs + 108'i32)
-    let qb0 = wByte(w, bs + qsOff0)
-    let qb1 = wByte(w, bs + qsOff1)
-    let hmByte = cint(wByte(w, bs + hmOff))
-    let r96 = wWord(w, bs + 96'i32)
-    let r100 = wWord(w, bs + 100'i32)
-    let r104 = wWord(w, bs + 104'i32)
-
-    q3kElemVec(acc, r96, r100, r104, dAll, sub,            qb0, 0, hmByte, 0, xArr, eb + tid)
-    q3kElemVec(acc, r96, r100, r104, dAll, 2'i32 + sub,    qb0, 2, hmByte, 1, xArr, eb + tid + 32'i32)
-    q3kElemVec(acc, r96, r100, r104, dAll, 4'i32 + sub,    qb0, 4, hmByte, 2, xArr, eb + tid + 64'i32)
-    q3kElemVec(acc, r96, r100, r104, dAll, 6'i32 + sub,    qb0, 6, hmByte, 3, xArr, eb + tid + 96'i32)
-    q3kElemVec(acc, r96, r100, r104, dAll, 8'i32 + sub,    qb1, 0, hmByte, 4, xArr, eb + tid + 128'i32)
-    q3kElemVec(acc, r96, r100, r104, dAll, 10'i32 + sub,   qb1, 2, hmByte, 5, xArr, eb + tid + 160'i32)
-    q3kElemVec(acc, r96, r100, r104, dAll, 12'i32 + sub,   qb1, 4, hmByte, 6, xArr, eb + tid + 192'i32)
-    q3kElemVec(acc, r96, r100, r104, dAll, 14'i32 + sub,   qb1, 6, hmByte, 7, xArr, eb + tid + 224'i32)
-    blkIdx = blkIdx + 1'i32
-
-  acc = acc + acc2
+  q3kILPAccumAll(acc, w, rowBase, nBlocksPerRow, sub, qsOff0, qsOff1, hmOff, tid, xArr)
   warpReduceSum(acc)
   if tid == 0'i32:
     outArr[row] = acc
-
-proc linearQ3K2RowWarpKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
-                             inDim: cint, outDim: cint) {.hippoGlobal.} =
-  ## 2-row Q3K GEMV: each warp handles 2 output rows, sharing activation loads.
-  let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
-  let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
-  let warpsPerBlock = cint(blockDim.x) div cint(mkc.WarpSize)
-  let row0 = (cint(blockIdx.x) * warpsPerBlock + warpId) * 2'i32
-  let row1 = row0 + 1'i32
-  if row0 >= outDim: return
-
-  let wArr = cast[ptr UncheckedArray[uint8]](w)
-  let xArr = cast[ptr UncheckedArray[cfloat]](x)
-  let outArr = cast[ptr UncheckedArray[cfloat]](dst)
-  let nBlocksPerRow = inDim div 256'i32
-  let rowSizeBytes = nBlocksPerRow * 110'i32
-  let rowBase0 = row0 * rowSizeBytes
-  let rowBase1 = row1 * rowSizeBytes
-  let hasRow1 = row1 < outDim
-  let tid = laneId
-  let sub = (tid shr 4'i32) and 1'i32
-  let qsOff0 = 32'i32 + sub * 16'i32 + (tid and 15'i32)
-  let qsOff1 = 64'i32 + sub * 16'i32 + (tid and 15'i32)
-  let hmOff = sub * 16'i32 + (tid and 15'i32)
-
-  var acc0: cfloat = 0.0
-  var acc1: cfloat = 0.0
-  var blkIdx: cint = 0
-  while blkIdx < nBlocksPerRow:
-    let eb = blkIdx * 256'i32
-    let xv0 = xArr[eb + tid]
-    let xv1 = xArr[eb + tid + 32'i32]
-    let xv2 = xArr[eb + tid + 64'i32]
-    let xv3 = xArr[eb + tid + 96'i32]
-    let xv4 = xArr[eb + tid + 128'i32]
-    let xv5 = xArr[eb + tid + 160'i32]
-    let xv6 = xArr[eb + tid + 192'i32]
-    let xv7 = xArr[eb + tid + 224'i32]
-    let bs0 = rowBase0 + blkIdx * 110'i32
-    q3kAccumBlockVec(acc0, wArr, bs0, sub, qsOff0, qsOff1, hmOff,
-                      xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7)
-    if hasRow1:
-      let bs1 = rowBase1 + blkIdx * 110'i32
-      q3kAccumBlockVec(acc1, wArr, bs1, sub, qsOff0, qsOff1, hmOff,
-                        xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7)
-    blkIdx = blkIdx + 1'i32
-
-  warpReduceSum(acc0)
-  if tid == 0'i32:
-    outArr[row0] = acc0
-  if hasRow1:
-    warpReduceSum(acc1)
-    if tid == 0'i32:
-      outArr[row1] = acc1
-
-proc linearQ3KDual2RowWarpKernel(dst1: ptr cfloat, dst2: ptr cfloat, x: ptr cfloat,
-                                  w1: ptr uint8, w2: ptr uint8,
-                                  inDim: cint, outDim: cint) {.hippoGlobal.} =
-  ## Dual Q3K 2-row: rows 0..2*outDim-1 mapped to w1/w2, each warp handles 2 rows.
-  let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
-  let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
-  let warpsPerBlock = cint(blockDim.x) div cint(mkc.WarpSize)
-  let rawRow = (cint(blockIdx.x) * warpsPerBlock + warpId) * 2'i32
-  let tid = laneId
-  let totalRows = outDim * 2'i32
-  if rawRow >= totalRows: return
-
-  let isSecond0 = rawRow >= outDim
-  let row0 = if isSecond0: rawRow - outDim else: rawRow
-  let w0 = if isSecond0: cast[ptr UncheckedArray[uint8]](w2)
-           else: cast[ptr UncheckedArray[uint8]](w1)
-  let out0 = if isSecond0: cast[ptr UncheckedArray[cfloat]](dst2)
-             else: cast[ptr UncheckedArray[cfloat]](dst1)
-
-  let rawRow1 = rawRow + 1'i32
-  let hasRow1 = rawRow1 < totalRows
-  let isSecond1 = rawRow1 >= outDim
-  let row1 = if isSecond1: rawRow1 - outDim else: rawRow1
-  let w1Arr = if isSecond1: cast[ptr UncheckedArray[uint8]](w2)
-              else: cast[ptr UncheckedArray[uint8]](w1)
-  let out1 = if isSecond1: cast[ptr UncheckedArray[cfloat]](dst2)
-             else: cast[ptr UncheckedArray[cfloat]](dst1)
-
-  let xArr = cast[ptr UncheckedArray[cfloat]](x)
-  let nBlocksPerRow = inDim div 256'i32
-  let rowSizeBytes = nBlocksPerRow * 110'i32
-  let rowBase0 = row0 * rowSizeBytes
-  let rowBase1 = row1 * rowSizeBytes
-  let sub = (tid shr 4'i32) and 1'i32
-  let qsOff0 = 32'i32 + sub * 16'i32 + (tid and 15'i32)
-  let qsOff1 = 64'i32 + sub * 16'i32 + (tid and 15'i32)
-  let hmOff = sub * 16'i32 + (tid and 15'i32)
-
-  var acc0: cfloat = 0.0
-  var acc1: cfloat = 0.0
-  var blkIdx: cint = 0
-  while blkIdx < nBlocksPerRow:
-    let eb = blkIdx * 256'i32
-    let xv0 = xArr[eb + tid]
-    let xv1 = xArr[eb + tid + 32'i32]
-    let xv2 = xArr[eb + tid + 64'i32]
-    let xv3 = xArr[eb + tid + 96'i32]
-    let xv4 = xArr[eb + tid + 128'i32]
-    let xv5 = xArr[eb + tid + 160'i32]
-    let xv6 = xArr[eb + tid + 192'i32]
-    let xv7 = xArr[eb + tid + 224'i32]
-    let bs0 = rowBase0 + blkIdx * 110'i32
-    q3kAccumBlockVec(acc0, w0, bs0, sub, qsOff0, qsOff1, hmOff,
-                      xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7)
-    if hasRow1:
-      let bs1 = rowBase1 + blkIdx * 110'i32
-      q3kAccumBlockVec(acc1, w1Arr, bs1, sub, qsOff0, qsOff1, hmOff,
-                        xv0, xv1, xv2, xv3, xv4, xv5, xv6, xv7)
-    blkIdx = blkIdx + 1'i32
-
-  warpReduceSum(acc0)
-  if tid == 0'i32:
-    out0[row0] = acc0
-  if hasRow1:
-    warpReduceSum(acc1)
-    if tid == 0'i32:
-      out1[row1] = acc1
-
-proc linearQ3KDualSiluWarpKernel(dst: ptr cfloat, x: ptr cfloat,
-                                  wGate: ptr uint8, wUp: ptr uint8,
-                                  inDim: cint, outDim: cint) {.hippoGlobal.} =
-  ## Fused dual Q3K GEMV + SiLU×mul: computes dst[row] = silu(gate·x) * (up·x).
-  ## Each warp processes one output row across both gate and up weight matrices.
-  let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
-  let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
-  let warpsPerBlock = cint(blockDim.x) div cint(mkc.WarpSize)
-  let row = cint(blockIdx.x) * warpsPerBlock + warpId
-  let tid = laneId
-  if row >= outDim: return
-
-  let gArr = cast[ptr UncheckedArray[uint8]](wGate)
-  let uArr = cast[ptr UncheckedArray[uint8]](wUp)
-  let xArr = cast[ptr UncheckedArray[cfloat]](x)
-  let outArr = cast[ptr UncheckedArray[cfloat]](dst)
-  let nBlocksPerRow = inDim div 256'i32
-  let rowSizeBytes = nBlocksPerRow * 110'i32
-  let rowBase = row * rowSizeBytes
-  let sub = (tid shr 4'i32) and 1'i32
-  let qsOff0 = 32'i32 + sub * 16'i32 + (tid and 15'i32)
-  let qsOff1 = 64'i32 + sub * 16'i32 + (tid and 15'i32)
-  let hmOff = sub * 16'i32 + (tid and 15'i32)
-
-  var accG: cfloat = 0.0
-  var accG2: cfloat = 0.0
-  var accU: cfloat = 0.0
-  var accU2: cfloat = 0.0
-  var blkIdx: cint = 0
-  while blkIdx + 1'i32 < nBlocksPerRow:
-    let bs0g = rowBase + blkIdx * 110'i32
-    let bs1g = rowBase + (blkIdx + 1'i32) * 110'i32
-    let bs0u = rowBase + blkIdx * 110'i32
-    let bs1u = rowBase + (blkIdx + 1'i32) * 110'i32
-    let eb0 = blkIdx * 256'i32
-    let eb1 = (blkIdx + 1'i32) * 256'i32
-
-    let dAll0g = wHalf(gArr, bs0g + 108'i32)
-    let dAll1g = wHalf(gArr, bs1g + 108'i32)
-    let qb0ag = wByte(gArr, bs0g + qsOff0); let qb1ag = wByte(gArr, bs0g + qsOff1)
-    let hmByte0g = cint(wByte(gArr, bs0g + hmOff))
-    let qb0bg = wByte(gArr, bs1g + qsOff0); let qb1bg = wByte(gArr, bs1g + qsOff1)
-    let hmByte1g = cint(wByte(gArr, bs1g + hmOff))
-    let r96_0g = wWord(gArr, bs0g + 96'i32)
-    let r100_0g = wWord(gArr, bs0g + 100'i32)
-    let r104_0g = wWord(gArr, bs0g + 104'i32)
-    let r96_1g = wWord(gArr, bs1g + 96'i32)
-    let r100_1g = wWord(gArr, bs1g + 100'i32)
-    let r104_1g = wWord(gArr, bs1g + 104'i32)
-
-    let dAll0u = wHalf(uArr, bs0u + 108'i32)
-    let dAll1u = wHalf(uArr, bs1u + 108'i32)
-    let qb0au = wByte(uArr, bs0u + qsOff0); let qb1au = wByte(uArr, bs0u + qsOff1)
-    let hmByte0u = cint(wByte(uArr, bs0u + hmOff))
-    let qb0bu = wByte(uArr, bs1u + qsOff0); let qb1bu = wByte(uArr, bs1u + qsOff1)
-    let hmByte1u = cint(wByte(uArr, bs1u + hmOff))
-    let r96_0u = wWord(uArr, bs0u + 96'i32)
-    let r100_0u = wWord(uArr, bs0u + 100'i32)
-    let r104_0u = wWord(uArr, bs0u + 104'i32)
-    let r96_1u = wWord(uArr, bs1u + 96'i32)
-    let r100_1u = wWord(uArr, bs1u + 100'i32)
-    let r104_1u = wWord(uArr, bs1u + 104'i32)
-
-    q3kElemVec(accG,  r96_0g, r100_0g, r104_0g, dAll0g, sub,          qb0ag, 0, hmByte0g, 0, xArr, eb0 + tid)
-    q3kElemVec(accU,  r96_0u, r100_0u, r104_0u, dAll0u, sub,          qb0au, 0, hmByte0u, 0, xArr, eb0 + tid)
-    q3kElemVec(accG2, r96_1g, r100_1g, r104_1g, dAll1g, sub,          qb0bg, 0, hmByte1g, 0, xArr, eb1 + tid)
-    q3kElemVec(accU2, r96_1u, r100_1u, r104_1u, dAll1u, sub,          qb0bu, 0, hmByte1u, 0, xArr, eb1 + tid)
-    q3kElemVec(accG,  r96_0g, r100_0g, r104_0g, dAll0g, 2'i32 + sub,  qb0ag, 2, hmByte0g, 1, xArr, eb0 + tid + 32'i32)
-    q3kElemVec(accU,  r96_0u, r100_0u, r104_0u, dAll0u, 2'i32 + sub,  qb0au, 2, hmByte0u, 1, xArr, eb0 + tid + 32'i32)
-    q3kElemVec(accG2, r96_1g, r100_1g, r104_1g, dAll1g, 2'i32 + sub,  qb0bg, 2, hmByte1g, 1, xArr, eb1 + tid + 32'i32)
-    q3kElemVec(accU2, r96_1u, r100_1u, r104_1u, dAll1u, 2'i32 + sub,  qb0bu, 2, hmByte1u, 1, xArr, eb1 + tid + 32'i32)
-    q3kElemVec(accG,  r96_0g, r100_0g, r104_0g, dAll0g, 4'i32 + sub,  qb0ag, 4, hmByte0g, 2, xArr, eb0 + tid + 64'i32)
-    q3kElemVec(accU,  r96_0u, r100_0u, r104_0u, dAll0u, 4'i32 + sub,  qb0au, 4, hmByte0u, 2, xArr, eb0 + tid + 64'i32)
-    q3kElemVec(accG2, r96_1g, r100_1g, r104_1g, dAll1g, 4'i32 + sub,  qb0bg, 4, hmByte1g, 2, xArr, eb1 + tid + 64'i32)
-    q3kElemVec(accU2, r96_1u, r100_1u, r104_1u, dAll1u, 4'i32 + sub,  qb0bu, 4, hmByte1u, 2, xArr, eb1 + tid + 64'i32)
-    q3kElemVec(accG,  r96_0g, r100_0g, r104_0g, dAll0g, 6'i32 + sub,  qb0ag, 6, hmByte0g, 3, xArr, eb0 + tid + 96'i32)
-    q3kElemVec(accU,  r96_0u, r100_0u, r104_0u, dAll0u, 6'i32 + sub,  qb0au, 6, hmByte0u, 3, xArr, eb0 + tid + 96'i32)
-    q3kElemVec(accG2, r96_1g, r100_1g, r104_1g, dAll1g, 6'i32 + sub,  qb0bg, 6, hmByte1g, 3, xArr, eb1 + tid + 96'i32)
-    q3kElemVec(accU2, r96_1u, r100_1u, r104_1u, dAll1u, 6'i32 + sub,  qb0bu, 6, hmByte1u, 3, xArr, eb1 + tid + 96'i32)
-    q3kElemVec(accG,  r96_0g, r100_0g, r104_0g, dAll0g, 8'i32 + sub,  qb1ag, 0, hmByte0g, 4, xArr, eb0 + tid + 128'i32)
-    q3kElemVec(accU,  r96_0u, r100_0u, r104_0u, dAll0u, 8'i32 + sub,  qb1au, 0, hmByte0u, 4, xArr, eb0 + tid + 128'i32)
-    q3kElemVec(accG2, r96_1g, r100_1g, r104_1g, dAll1g, 8'i32 + sub,  qb1bg, 0, hmByte1g, 4, xArr, eb1 + tid + 128'i32)
-    q3kElemVec(accU2, r96_1u, r100_1u, r104_1u, dAll1u, 8'i32 + sub,  qb1bu, 0, hmByte1u, 4, xArr, eb1 + tid + 128'i32)
-    q3kElemVec(accG,  r96_0g, r100_0g, r104_0g, dAll0g, 10'i32 + sub, qb1ag, 2, hmByte0g, 5, xArr, eb0 + tid + 160'i32)
-    q3kElemVec(accU,  r96_0u, r100_0u, r104_0u, dAll0u, 10'i32 + sub, qb1au, 2, hmByte0u, 5, xArr, eb0 + tid + 160'i32)
-    q3kElemVec(accG2, r96_1g, r100_1g, r104_1g, dAll1g, 10'i32 + sub, qb1bg, 2, hmByte1g, 5, xArr, eb1 + tid + 160'i32)
-    q3kElemVec(accU2, r96_1u, r100_1u, r104_1u, dAll1u, 10'i32 + sub, qb1bu, 2, hmByte1u, 5, xArr, eb1 + tid + 160'i32)
-    q3kElemVec(accG,  r96_0g, r100_0g, r104_0g, dAll0g, 12'i32 + sub, qb1ag, 4, hmByte0g, 6, xArr, eb0 + tid + 192'i32)
-    q3kElemVec(accU,  r96_0u, r100_0u, r104_0u, dAll0u, 12'i32 + sub, qb1au, 4, hmByte0u, 6, xArr, eb0 + tid + 192'i32)
-    q3kElemVec(accG2, r96_1g, r100_1g, r104_1g, dAll1g, 12'i32 + sub, qb1bg, 4, hmByte1g, 6, xArr, eb1 + tid + 192'i32)
-    q3kElemVec(accU2, r96_1u, r100_1u, r104_1u, dAll1u, 12'i32 + sub, qb1bu, 4, hmByte1u, 6, xArr, eb1 + tid + 192'i32)
-    q3kElemVec(accG,  r96_0g, r100_0g, r104_0g, dAll0g, 14'i32 + sub, qb1ag, 6, hmByte0g, 7, xArr, eb0 + tid + 224'i32)
-    q3kElemVec(accU,  r96_0u, r100_0u, r104_0u, dAll0u, 14'i32 + sub, qb1au, 6, hmByte0u, 7, xArr, eb0 + tid + 224'i32)
-    q3kElemVec(accG2, r96_1g, r100_1g, r104_1g, dAll1g, 14'i32 + sub, qb1bg, 6, hmByte1g, 7, xArr, eb1 + tid + 224'i32)
-    q3kElemVec(accU2, r96_1u, r100_1u, r104_1u, dAll1u, 14'i32 + sub, qb1bu, 6, hmByte1u, 7, xArr, eb1 + tid + 224'i32)
-    blkIdx = blkIdx + 2'i32
-
-  while blkIdx < nBlocksPerRow:
-    let bsg = rowBase + blkIdx * 110'i32
-    let bsu = rowBase + blkIdx * 110'i32
-    let eb = blkIdx * 256'i32
-    let dAllg = wHalf(gArr, bsg + 108'i32)
-    let qb0g = wByte(gArr, bsg + qsOff0); let qb1g = wByte(gArr, bsg + qsOff1)
-    let hmByteg = cint(wByte(gArr, bsg + hmOff))
-    let r96g = wWord(gArr, bsg + 96'i32)
-    let r100g = wWord(gArr, bsg + 100'i32)
-    let r104g = wWord(gArr, bsg + 104'i32)
-    let dAllu = wHalf(uArr, bsu + 108'i32)
-    let qb0u = wByte(uArr, bsu + qsOff0); let qb1u = wByte(uArr, bsu + qsOff1)
-    let hmByteu = cint(wByte(uArr, bsu + hmOff))
-    let r96u = wWord(uArr, bsu + 96'i32)
-    let r100u = wWord(uArr, bsu + 100'i32)
-    let r104u = wWord(uArr, bsu + 104'i32)
-
-    q3kElemVec(accG, r96g, r100g, r104g, dAllg, sub,          qb0g, 0, hmByteg, 0, xArr, eb + tid)
-    q3kElemVec(accU, r96u, r100u, r104u, dAllu, sub,          qb0u, 0, hmByteu, 0, xArr, eb + tid)
-    q3kElemVec(accG, r96g, r100g, r104g, dAllg, 2'i32 + sub,  qb0g, 2, hmByteg, 1, xArr, eb + tid + 32'i32)
-    q3kElemVec(accU, r96u, r100u, r104u, dAllu, 2'i32 + sub,  qb0u, 2, hmByteu, 1, xArr, eb + tid + 32'i32)
-    q3kElemVec(accG, r96g, r100g, r104g, dAllg, 4'i32 + sub,  qb0g, 4, hmByteg, 2, xArr, eb + tid + 64'i32)
-    q3kElemVec(accU, r96u, r100u, r104u, dAllu, 4'i32 + sub,  qb0u, 4, hmByteu, 2, xArr, eb + tid + 64'i32)
-    q3kElemVec(accG, r96g, r100g, r104g, dAllg, 6'i32 + sub,  qb0g, 6, hmByteg, 3, xArr, eb + tid + 96'i32)
-    q3kElemVec(accU, r96u, r100u, r104u, dAllu, 6'i32 + sub,  qb0u, 6, hmByteu, 3, xArr, eb + tid + 96'i32)
-    q3kElemVec(accG, r96g, r100g, r104g, dAllg, 8'i32 + sub,  qb1g, 0, hmByteg, 4, xArr, eb + tid + 128'i32)
-    q3kElemVec(accU, r96u, r100u, r104u, dAllu, 8'i32 + sub,  qb1u, 0, hmByteu, 4, xArr, eb + tid + 128'i32)
-    q3kElemVec(accG, r96g, r100g, r104g, dAllg, 10'i32 + sub, qb1g, 2, hmByteg, 5, xArr, eb + tid + 160'i32)
-    q3kElemVec(accU, r96u, r100u, r104u, dAllu, 10'i32 + sub, qb1u, 2, hmByteu, 5, xArr, eb + tid + 160'i32)
-    q3kElemVec(accG, r96g, r100g, r104g, dAllg, 12'i32 + sub, qb1g, 4, hmByteg, 6, xArr, eb + tid + 192'i32)
-    q3kElemVec(accU, r96u, r100u, r104u, dAllu, 12'i32 + sub, qb1u, 4, hmByteu, 6, xArr, eb + tid + 192'i32)
-    q3kElemVec(accG, r96g, r100g, r104g, dAllg, 14'i32 + sub, qb1g, 6, hmByteg, 7, xArr, eb + tid + 224'i32)
-    q3kElemVec(accU, r96u, r100u, r104u, dAllu, 14'i32 + sub, qb1u, 6, hmByteu, 7, xArr, eb + tid + 224'i32)
-    blkIdx = blkIdx + 1'i32
-
-  accG = accG + accG2
-  accU = accU + accU2
-  warpReduceSum(accG)
-  warpReduceSum(accU)
-  if tid == 0'i32:
-    let g = accG
-    outArr[row] = (g / (1.0f + expf(-g))) * accU
 
 proc linearQ3KDualSiluSimpleWarpKernel(dst: ptr cfloat, x: ptr cfloat,
                                         wGate: ptr uint8, wUp: ptr uint8,
