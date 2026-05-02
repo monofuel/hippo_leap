@@ -456,6 +456,97 @@ proc linearQ2KDualWarpKernel(dst1: ptr cfloat, dst2: ptr cfloat, x: ptr cfloat,
   if laneId == 0'i32:
     outArr[row] = acc
 
+proc linearQ2KQ3KTripleWarpKernel(dst1: ptr cfloat, dst2: ptr cfloat, dst3: ptr cfloat,
+                                   x: ptr cfloat,
+                                   w1: ptr uint8, w2: ptr uint8, w3: ptr uint8,
+                                   inDim: cint, outDim1: cint, outDim2: cint,
+                                   outDim3: cint) {.hippoGlobal.} =
+  ## Triple GEMV: rows 0..outDim1-1 → Q2K w1→dst1, outDim1..outDim1+outDim2-1 → Q2K w2→dst2,
+  ## outDim1+outDim2..total-1 → Q3K w3→dst3.
+  let warpId = cint(threadIdx.x) div cint(mkc.WarpSize)
+  let laneId = cint(threadIdx.x) mod cint(mkc.WarpSize)
+  let warpsPerBlock = cint(blockDim.x) div cint(mkc.WarpSize)
+  let rawRow = cint(blockIdx.x) * warpsPerBlock + warpId
+  let totalQ2K = outDim1 + outDim2
+  let totalRows = totalQ2K + outDim3
+  if rawRow >= totalRows: return
+
+  let xArr = cast[ptr UncheckedArray[cfloat]](x)
+  let nBlocksPerRow = inDim div cint(QK_K)
+
+  if rawRow < totalQ2K:
+    let isSecond = rawRow >= outDim1
+    let row = if isSecond: rawRow - outDim1 else: rawRow
+    let outDim = if isSecond: outDim2 else: outDim1
+    if row >= outDim: return
+    let wArr = if isSecond: cast[ptr UncheckedArray[uint8]](w2)
+               else: cast[ptr UncheckedArray[uint8]](w1)
+    let outArr = if isSecond: cast[ptr UncheckedArray[cfloat]](dst2)
+                 else: cast[ptr UncheckedArray[cfloat]](dst1)
+    let rowSizeBytes = nBlocksPerRow * cint(BlockQ2KSize)
+    let rowBase = row * rowSizeBytes
+    let sub = (laneId shr 4'i32) and 1'i32
+    let qsOff0 = 16'i32 + sub * 16'i32 + (laneId and 15'i32)
+    let qsOff1 = 48'i32 + sub * 16'i32 + (laneId and 15'i32)
+    var acc: cfloat = 0.0
+    var blkIdx: cint = 0
+    while blkIdx < nBlocksPerRow:
+      let bs = rowBase + blkIdx * cint(BlockQ2KSize)
+      let eb = blkIdx * cint(QK_K)
+      let ddm = hippoLoadU32(addr wArr[bs + 80'i32])
+      let d = hippoHalfToFloat(uint16(ddm and 0xFFFF'u32))
+      let dm = hippoHalfToFloat(uint16(ddm shr 16))
+      let qb0 = wArr[bs + qsOff0]
+      let qb1 = wArr[bs + qsOff1]
+      q2kAccumBlock(acc, wArr, bs, d, dm, qb0, qb1, sub, xArr, eb, laneId)
+      blkIdx = blkIdx + 1'i32
+    warpReduceSum(acc)
+    if laneId == 0'i32:
+      outArr[row] = acc
+  else:
+    let row = rawRow - totalQ2K
+    let wArr = cast[ptr UncheckedArray[uint8]](w3)
+    let outArr = cast[ptr UncheckedArray[cfloat]](dst3)
+    let rowSizeBytes = nBlocksPerRow * 110'i32
+    let rowBase = row * rowSizeBytes
+    let tid = laneId
+    let sub = (tid shr 4'i32) and 1'i32
+    let qsOff0 = 32'i32 + sub * 16'i32 + (tid and 15'i32)
+    let qsOff1 = 64'i32 + sub * 16'i32 + (tid and 15'i32)
+    let hmOff = sub * 16'i32 + (tid and 15'i32)
+    var acc: cfloat = 0.0
+    var acc2: cfloat = 0.0
+    var blkIdx: cint = 0
+    while blkIdx + 1'i32 < nBlocksPerRow:
+      let bs0 = rowBase + blkIdx * 110'i32
+      let bs1 = rowBase + (blkIdx + 1'i32) * 110'i32
+      let eb0 = blkIdx * 256'i32
+      let eb1 = (blkIdx + 1'i32) * 256'i32
+      q3kAccumBlockVec(acc, wArr, bs0, sub, qsOff0, qsOff1, hmOff,
+                        xArr[eb0 + tid], xArr[eb0 + tid + 32'i32],
+                        xArr[eb0 + tid + 64'i32], xArr[eb0 + tid + 96'i32],
+                        xArr[eb0 + tid + 128'i32], xArr[eb0 + tid + 160'i32],
+                        xArr[eb0 + tid + 192'i32], xArr[eb0 + tid + 224'i32])
+      q3kAccumBlockVec(acc2, wArr, bs1, sub, qsOff0, qsOff1, hmOff,
+                        xArr[eb1 + tid], xArr[eb1 + tid + 32'i32],
+                        xArr[eb1 + tid + 64'i32], xArr[eb1 + tid + 96'i32],
+                        xArr[eb1 + tid + 128'i32], xArr[eb1 + tid + 160'i32],
+                        xArr[eb1 + tid + 192'i32], xArr[eb1 + tid + 224'i32])
+      blkIdx = blkIdx + 2'i32
+    while blkIdx < nBlocksPerRow:
+      let bs = rowBase + blkIdx * 110'i32
+      let eb = blkIdx * 256'i32
+      q3kAccumBlockVec(acc, wArr, bs, sub, qsOff0, qsOff1, hmOff,
+                        xArr[eb + tid], xArr[eb + tid + 32'i32],
+                        xArr[eb + tid + 64'i32], xArr[eb + tid + 96'i32],
+                        xArr[eb + tid + 128'i32], xArr[eb + tid + 160'i32],
+                        xArr[eb + tid + 192'i32], xArr[eb + tid + 224'i32])
+      blkIdx = blkIdx + 1'i32
+    acc = acc + acc2
+    warpReduceSum(acc)
+    if tid == 0'i32:
+      outArr[row] = acc
+
 proc linearQ2K2RowWarpKernel(dst: ptr cfloat, x: ptr cfloat, w: ptr uint8,
                              inDim: cint, outDim: cint) {.hippoGlobal.} =
   ## 2-row Q2K GEMV: each warp handles 2 output rows, sharing activation loads.
@@ -2319,6 +2410,27 @@ proc gpuLinearQ2KDual(dst1, dst2, x: pointer, w1, w2: MkWeight, inDim, outDim1, 
     stream = mkStream,
     args = hippoArgs(dst1P, dst2P, xP, w1P, w2P, iDim, oDim1, oDim2))
 
+proc gpuLinearQ2KQ3KTriple(dst1, dst2, dst3, x: pointer,
+                            w1, w2: MkWeight, w3: MkWeight,
+                            inDim, outDim1, outDim2, outDim3: int) =
+  var dst1P = cast[ptr cfloat](dst1)
+  var dst2P = cast[ptr cfloat](dst2)
+  var dst3P = cast[ptr cfloat](dst3)
+  var xP = cast[ptr cfloat](x)
+  var w1P = cast[ptr uint8](w1.p)
+  var w2P = cast[ptr uint8](w2.p)
+  var w3P = cast[ptr uint8](w3.p)
+  var iDim = cint(inDim)
+  var oDim1 = cint(outDim1)
+  var oDim2 = cint(outDim2)
+  var oDim3 = cint(outDim3)
+  let totalRows = (outDim1 + outDim2 + outDim3).uint32
+  let nBlocks = (totalRows + WarpsPerLaunchBlock - 1) div WarpsPerLaunchBlock
+  hippoLaunchKernel(linearQ2KQ3KTripleWarpKernel,
+    gridDim = newDim3(nBlocks), blockDim = newDim3(WarpsPerLaunchBlock * mkc.WarpSize.uint32),
+    stream = mkStream,
+    args = hippoArgs(dst1P, dst2P, dst3P, xP, w1P, w2P, w3P, iDim, oDim1, oDim2, oDim3))
+
 proc gpuLinearQ3KDual(dst1, dst2, x: pointer, w1, w2: MkWeight, inDim, outDim: int) =
   var dst1P = cast[ptr cfloat](dst1)
   var dst2P = cast[ptr cfloat](dst2)
@@ -2721,13 +2833,19 @@ proc forwardDecodeGpu(token: int32, curLen: int) =
         else:
           gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
       else:
-        if lw.wq.qtype == GgmlTypeQ2K.int32 and lw.wk.qtype == GgmlTypeQ2K.int32:
+        if lw.wq.qtype == GgmlTypeQ2K.int32 and lw.wk.qtype == GgmlTypeQ2K.int32 and
+           lw.wv.qtype == GgmlTypeQ3K.int32:
+          gpuLinearQ2KQ3KTriple(mkBuf.scratch0, mkBuf.scratch1, mkBuf.scratch2,
+                                mkBuf.act1, lw.wq, lw.wk, lw.wv,
+                                ModelCfg.nEmb, QDim, KvDim, KvDim)
+        elif lw.wq.qtype == GgmlTypeQ2K.int32 and lw.wk.qtype == GgmlTypeQ2K.int32:
           gpuLinearQ2KDual(mkBuf.scratch0, mkBuf.scratch1, mkBuf.act1,
                            lw.wq, lw.wk, ModelCfg.nEmb, QDim, KvDim)
+          gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
         else:
           gpuLinear(mkBuf.scratch0, mkBuf.act1, lw.wq, ModelCfg.nEmb, QDim)
           gpuLinear(mkBuf.scratch1, mkBuf.act1, lw.wk, ModelCfg.nEmb, KvDim)
-        gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
+          gpuLinear(mkBuf.scratch2, mkBuf.act1, lw.wv, ModelCfg.nEmb, KvDim)
       gpuRopeAndKVStore(mkBuf.scratch0, mkBuf.scratch1, mkWeights.ropeTheta,
                         kvK, mkBuf.scratch2, kvV, curLen, cacheCols)
       gpuAttentionDecode(mkBuf.scratch1, mkBuf.scratch0, kvK, kvV, curLen + 1, cacheCols)
