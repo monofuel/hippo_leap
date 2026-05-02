@@ -30,6 +30,12 @@ tools: nim.cfg
 
 # --- Benchmark targets ---
 
+build-graph: nim.cfg
+	nim cpp $(NIM_COMMON_FLAGS) \
+		-d:backendMegakernel -d:useIndividualLaunches -d:useGraphCapture \
+		-d:targetMachine=azem -d:targetModel=tinyllama_q2k \
+		-o:hippo_leap src/hippo_leap.nim
+
 bench: build-megakernel
 	./hippo_leap bench -m /mnt/steel-chest/LLM/lmstudio/models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf
 
